@@ -1,7 +1,5 @@
 import os
 import pandas as pd
-from PIL import Image
-import piexif
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from geopy.distance import geodesic
