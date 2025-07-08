@@ -1,32 +1,23 @@
 import serial
-from pysbf2 import SBFReader, SBF_PROTOCOL
+import pynmea2
 
-ser = serial.Serial('COM3', 115200, timeout=1)
+ser = serial.Serial('COM10', 115200, timeout=1)
 
-reader = SBFReader(
-    ser,
-    protfilter=SBF_PROTOCOL,
-    quitonerror=1,
-    validate=1
-)
-print(reader)
 while True:
-    raw, msg = reader.read()
-    if not msg:
-        print("No message received or error in reading.")
-        print(f"Raw data: {raw}")
+    line = ser.readline().decode('ascii', errors='ignore').strip()
+    if not line.startswith('$'):
         continue
+    try:
+        msg = pynmea2.parse(line)
 
-    if msg.name == "PVTGeodetic":
-        tow = msg.fields["TOW"]
-        lat = msg.fields["Latitude"]
-        lon = msg.fields["Longitude"]
-        alt = msg.fields["Height"]
-        print(f"TOW: {tow} ms | Lat: {lat:.6f} | Lon: {lon:.6f} | Alt: {alt:.2f} m")
+        if isinstance(msg, pynmea2.types.talker.GGA):
+            print(f"[GGA] TOW: {msg.timestamp} | Lat: {msg.latitude}° | Lon: {msg.longitude}° | Alt: {msg.altitude} {msg.altitude_units}")
 
-    elif msg.name == "Heading":
-        heading = msg.fields["Heading"]
-        print(f"Heading: {heading:.2f}°")
-    else:
-        print("Fail")
-        print(f"Unknown message: {msg.name}")
+        elif isinstance(msg, pynmea2.types.talker.HDT):
+            print(f"[HDT] Heading: {msg.heading}°")
+
+        elif isinstance(msg, pynmea2.types.talker.RMC):
+            print(f"[RMC] Time: {msg.timestamp}, Date: {msg.datestamp}")
+
+    except pynmea2.ParseError:
+        continue
