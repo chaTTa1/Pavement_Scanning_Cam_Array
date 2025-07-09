@@ -5,7 +5,7 @@ import time
 import datetime
 
 # Set up serial port and baud rate
-SERIAL_PORT = 'COM3'
+SERIAL_PORT = 'COMX'  # Replace with your actual COM port
 BAUDRATE = 115200
 
 # Output CSV file
