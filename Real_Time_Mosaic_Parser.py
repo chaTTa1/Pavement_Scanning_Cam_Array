@@ -1,7 +1,7 @@
 import serial
 import pynmea2
 
-ser = serial.Serial('COM10', 115200, timeout=1)
+ser = serial.Serial('COM3', 115200, timeout=1)
 
 while True:
     line = ser.readline().decode('ascii', errors='ignore').strip()

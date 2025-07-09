@@ -72,9 +72,9 @@ ekf.Q = np.eye(16) * 0.1  # Process noise (tune as needed)
 
 
 # --- Serial port setup ---
-IMU_PORT = 'COM3'
+IMU_PORT = 'COM5'
 IMU_BAUD = 115200
-GPS_PORT = 'COM10'
+GPS_PORT = 'COM3'
 GPS_BAUD = 115200
 
 imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0.01)
@@ -124,14 +124,29 @@ def read_imu_packet(ser):
         return timestamp, data
 
 def read_gps_line(ser):
+    """
+    Parse GPS data exactly as in Real_Time_Mosaic_Parser.py.
+    Returns (lat, lon, alt) if GGA sentence, else None.
+    """
     line = ser.readline().decode('ascii', errors='ignore').strip()
     if not line.startswith('$'):
         return None
     try:
         msg = pynmea2.parse(line)
+
         if isinstance(msg, pynmea2.types.talker.GGA):
-            # Returns (lat, lon, alt)
+            # For debugging, you can uncomment the next line:
+            # print(f"[GGA] TOW: {msg.timestamp} | Lat: {msg.latitude}° | Lon: {msg.longitude}° | Alt: {msg.altitude} {msg.altitude_units}")
             return float(msg.latitude), float(msg.longitude), float(msg.altitude)
+
+        elif isinstance(msg, pynmea2.types.talker.HDT):
+            # print(f"[HDT] Heading: {msg.heading}°")
+            return float(msg.heading)
+
+        elif isinstance(msg, pynmea2.types.talker.RMC):
+            # print(f"[RMC] Time: {msg.timestamp}, Date: {msg.datestamp}")
+            return float(msg.timestamp)
+
     except pynmea2.ParseError:
         return None
 
@@ -174,7 +189,7 @@ while True:
 
     # EKF predict
     predict_start = time.perf_counter()
-    ekf.predict(fx=fx, u=u, dt=dt)
+    ekf.x = fx(ekf.x, u, dt)  # <--- update state using your fx function
     predict_end = time.perf_counter()
 
     # --- Try GPS update (non-blocking) ---
