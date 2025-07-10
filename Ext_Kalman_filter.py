@@ -174,7 +174,7 @@ def read_gps_line(ser):
 
         elif isinstance(msg, pynmea2.types.talker.HDT):
             # print(f"[HDT] Heading: {msg.heading}°")
-            return None
+            return float(msg.heading), None, None
 
         elif isinstance(msg, pynmea2.types.talker.RMC):
             # print(f"[RMC] Time: {msg.timestamp}, Date: {msg.datestamp}")
