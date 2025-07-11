@@ -9,33 +9,6 @@ from geopy.distance import geodesic
 from geopy.point import Point
 
 
-
-def correct_yaw_from_mag(quat, mag_vector, correction_strength=0.01):
-    """
-    Corrects yaw based on magnetometer heading.
-
-    quat: current orientation quaternion (x, y, z, w)
-    mag_vector: 3D magnetometer vector (x, y, z)
-    correction_strength: small gain to apply correction
-    """
-    # Normalize magnetometer vector
-    mag_vector = mag_vector / np.linalg.norm(mag_vector)
-
-    # Estimated yaw from quaternion
-    r = R.from_quat(quat)
-    yaw_imu = r.as_euler('zyx')[0]  # in radians
-
-    # Heading from magnetometer (horizontal projection)
-    mag_heading = np.arctan2(mag_vector[1], mag_vector[0])  # yaw from X/Y
-
-    # Compute error and apply small corrective yaw
-    yaw_error = mag_heading - yaw_imu
-    yaw_correction = R.from_euler('z', correction_strength * yaw_error)
-    corrected = yaw_correction * r
-
-    return corrected.as_quat()
-
-
 def quaternion_propagate(q, omega, dt):
     """
     Propagate quaternion with angular velocity omega over dt
@@ -101,7 +74,7 @@ ekf.P = np.eye(16) * 100
 ekf.Q = np.eye(16) * 10.0
 ekf.Q[10:13, 10:13] = np.eye(3) * 0.01  # gyro bias
 ekf.Q[13:16, 13:16] = np.eye(3) * 2.0  # or even higher
-ekf.R = np.diag([0.01**2, 0.01**2, 0.02**2])  # RTK GPS accuracy
+ekf.R = np.eye(3) * 0.0001
 
 
 # --- Serial port setup ---
@@ -174,7 +147,7 @@ def read_gps_line(ser):
 
         elif isinstance(msg, pynmea2.types.talker.HDT):
             # print(f"[HDT] Heading: {msg.heading}°")
-            return float(msg.heading), None, None
+            return None
 
         elif isinstance(msg, pynmea2.types.talker.RMC):
             # print(f"[RMC] Time: {msg.timestamp}, Date: {msg.datestamp}")
@@ -189,6 +162,13 @@ reference_gps_time = None
 REFERENCE_GPS_SAMPLE_COUNT = 10
 REFERENCE_GPS_STATIONARY_SECONDS = 2.0
 REFERENCE_GPS_POSITION_TOL = 0.00001  # about 1 meter
+
+# Wait for first valid GPS fix to set reference_gps
+while reference_gps is None:
+    gps_fix = read_gps_line(gps_ser)
+    if gps_fix is not None:
+        reference_gps = gps_fix
+        print(f"Reference GPS set: {reference_gps}")
 
 # --- Main fusion loop ---
 while True:
@@ -217,71 +197,23 @@ while True:
     if last_imu_time is None:
         last_imu_time = imu_timestamp
         continue
-    dt = (imu_timestamp - last_imu_time) / 1e6  # microseconds to seconds
+    dt = (imu_timestamp - last_imu_time) / 1e6
     last_imu_time = imu_timestamp
 
-    # EKF predict
-    predict_start = time.perf_counter()
-    ekf.x = fx(ekf.x, u, dt)  # <--- update state using your fx function
-    predict_end = time.perf_counter()
+    # EKF predict (dead-reckoning)
+    ekf.x = fx(ekf.x, u, dt)
 
-    # --- Try GPS update (non-blocking) ---
+    # --- GPS update ---
     gps_fix = read_gps_line(gps_ser)
-    update_time = None
-    if gps_fix is not None:
+    if gps_fix is not None and reference_gps is not None:
         lat, lon, alt = gps_fix
-
-        # Reference GPS logic
-        if reference_gps is None:
-            now = time.time()
-            if reference_gps_time is None:
-                reference_gps_time = now
-                reference_gps_samples = [(lat, lon, alt)]
-            else:
-                reference_gps_samples.append((lat, lon, alt))
-                print(f"Collecting reference samples: {len(reference_gps_samples)}")
-                # Check if stationary
-                if len(reference_gps_samples) >= REFERENCE_GPS_SAMPLE_COUNT:
-                    lats = [s[0] for s in reference_gps_samples]
-                    lons = [s[1] for s in reference_gps_samples]
-                    alts = [s[2] for s in reference_gps_samples]
-                    if (max(lats) - min(lats) < REFERENCE_GPS_POSITION_TOL and
-                        max(lons) - min(lons) < REFERENCE_GPS_POSITION_TOL and
-                        max(alts) - min(alts) < 2):  # 2 meters altitude tolerance
-                        if now - reference_gps_time >= REFERENCE_GPS_STATIONARY_SECONDS:
-                            # Use mean as reference
-                            reference_gps = (
-                                sum(lats) / len(lats),
-                                sum(lons) / len(lons),
-                                sum(alts) / len(alts)
-                            )
-                            print(f"Reference GPS set: {reference_gps}")
-                    else:
-                        # Movement detected, reset
-                        reference_gps_time = now
-                        reference_gps_samples = [(lat, lon, alt)]
-            continue  # Don't update EKF until reference is set
-
-        # Convert lat/lon/alt to local ENU offset from reference
-        ref_point = Point(reference_gps[0], reference_gps[1])
-        # Approximate ENU (East, North, Up)
+        # Convert to ENU
         e = geodesic((reference_gps[0], reference_gps[1]), (reference_gps[0], lon)).meters * (1 if lon >= reference_gps[1] else -1)
         n = geodesic((reference_gps[0], reference_gps[1]), (lat, reference_gps[1])).meters * (1 if lat >= reference_gps[0] else -1)
         u_ = alt - reference_gps[2]
-        z = np.array([e, n, u_])
-        update_start = time.perf_counter()
-        ekf.update(z=z, HJacobian=H_jacobian, Hx=hx)
-        update_end = time.perf_counter()
-        update_time = update_end - update_start
+        # Directly set EKF position to GPS
+        ekf.x[0:3] = [e, n, u_]
 
-        # Debugging: Print innovation and Kalman Gain
-        print("Innovation:", z - hx(ekf.x))
-        print("Kalman Gain (diag):", np.diag(ekf.K))
-        print("GPS update applied:", z)
-
-        print("Reference GPS:", reference_gps)
-        print("ENU from GPS:", e, n, u_)
-#change github
     # --- Output current state as GPS ---
     if reference_gps is not None:
         x, y, z_ = ekf.x[0:3]  # EKF position in meters (ENU)
