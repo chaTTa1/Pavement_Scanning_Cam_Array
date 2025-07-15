@@ -12,15 +12,37 @@ from tkinter import Image
 import PySpin
 import sys
 import cv2
-import piexif
-import usb.core
-import lcpy
+#import piexif
+#import usb.core
+#import lcpy
 import numpy as np
 from datetime import datetime, timezone
 from time import perf_counter_ns
 import piexif
 from PIL import Image
 from exif import Image
+import threading
+import socket
+import json
+
+# --- Camera identifier: set this for each camera script ---
+CAMERA_ID = "left"  # Change to "mid" or "right" for each camera
+
+latest_gps = { "lat": None, "lon": None, "alt": None }
+
+def gps_listener(udp_port=5005):
+    global latest_gps
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.bind(('', udp_port))
+    while True:
+        data, _ = sock.recvfrom(4096)
+        try:
+            gps_data = json.loads(data.decode())
+            if CAMERA_ID in gps_data:
+                latest_gps = gps_data[CAMERA_ID]
+        except Exception as e:
+            print("GPS packet error:", e)
 
 
 def get_tow_from_utc():
@@ -1265,6 +1287,10 @@ def print_trigger_config(nodemap, s_node_map, triggerType="software"):
         get_IFloat_node_current_val(nodemap, 'TriggerDelay')
 
 def main():
+    # Start GPS listener thread
+    gps_thread = threading.Thread(target=gps_listener, daemon=True)
+    gps_thread.start()
+
     acquisition_index = 0
     num_images = 15
     triggerType = "Off"
@@ -1303,6 +1329,22 @@ def main():
 
     return result
 
+
+# --- Add EXIF GPS writing function ---
+def embed_gps_with_exif(image_path, gps):
+    """
+    Write GPS coordinates to EXIF metadata.
+    gps: dict with 'lat', 'lon', 'alt'
+    """
+    with open(image_path, 'rb') as img_file:
+        img = Image(img_file)
+    if gps and gps["lat"] is not None and gps["lon"] is not None:
+        img.gps_latitude = gps['lat']
+        img.gps_longitude = gps['lon']
+        img.gps_altitude = gps['alt']
+    with open(image_path, 'wb') as new_file:
+        new_file.write(img.get_file())
+    return True
 
 if __name__ == '__main__':
     if main():

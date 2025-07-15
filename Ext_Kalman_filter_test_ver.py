@@ -7,6 +7,9 @@ import struct
 import time
 from geopy.distance import geodesic
 from geopy.point import Point
+import socket
+import json
+
 
 # Setup UDP broadcast socket
 UDP_IP = "192.168.1.255"  
@@ -179,7 +182,7 @@ reference_gps_samples = []
 reference_gps_time = None
 REFERENCE_GPS_SAMPLE_COUNT = 10
 REFERENCE_GPS_STATIONARY_SECONDS = 2.0
-REFERENCE_GPS_POSITION_TOL = 0.00001  # about 1 meter
+REFERENCE_GPS_POSITION_TOL = 0.000001  
 
 # Wait for first valid GPS fix to set reference_gps
 while reference_gps is None:
@@ -187,6 +190,51 @@ while reference_gps is None:
     if gps_fix is not None:
         reference_gps = gps_fix
         print(f"Reference GPS set: {reference_gps}")
+
+def convert_camera_gps(lat, lon, alt, heading_deg, camisleft_flag):
+    """
+    Converts main GPS + heading to left/mid/right camera GPS positions.
+    """
+    # Camera offsets (meters)
+    l_dist = 0.6
+    r_dist = 0.4
+    m_dist = 0.1
+
+    # Convert heading to radians
+    heading = np.radians(heading_deg)
+
+    # Calculate ENU offsets for each camera
+    # Left camera
+    left_e = l_dist * np.sin(heading)
+    left_n = l_dist * np.cos(heading)
+    # Mid camera
+    mid_e = m_dist * np.sin(heading)
+    mid_n = m_dist * np.cos(heading)
+    # Right camera
+    right_e = r_dist * np.sin(heading)
+    right_n = r_dist * np.cos(heading)
+
+    # Reference point
+    ref_point = Point(lat, lon)
+
+    # Calculate GPS positions using geopy
+    left_point = geodesic(meters=np.sqrt(left_e**2 + left_n**2)).destination(ref_point, (np.degrees(np.arctan2(left_e, left_n)) % 360))
+    mid_point = geodesic(meters=np.sqrt(mid_e**2 + mid_n**2)).destination(ref_point, (np.degrees(np.arctan2(mid_e, mid_n)) % 360))
+    right_point = geodesic(meters=np.sqrt(right_e**2 + right_n**2)).destination(ref_point, (np.degrees(np.arctan2(right_e, right_n)) % 360))
+
+    return (
+        (left_point.latitude, left_point.longitude),
+        (mid_point.latitude, mid_point.longitude),
+        (right_point.latitude, right_point.longitude)
+    )
+
+def broadcast_gps(lat, lon, alt, heading_deg):
+    """
+    Broadcasts all three camera GPS positions.
+    """
+    left, mid, right = convert_camera_gps(lat, lon, alt, heading_deg, CAMISLEFT_FLAG)
+    broadcast_all_camera_positions(left, mid, right, alt)
+
 
 # --- Main fusion loop ---
 while True:
@@ -240,8 +288,9 @@ while True:
         ref_point = Point(reference_gps[0], reference_gps[1])
         dest = geodesic(meters=flat_distance).destination(ref_point, bearing)
         alt_out = reference_gps[2] + z_
+        heading_deg = bearing  # Use EKF bearing as heading
         print(f"EKF GPS: lat={dest.latitude:.8f}, lon={dest.longitude:.8f}, alt={alt_out:.2f}")
-        broadcast_gps(dest.latitude, dest.longitude, alt_out)
+        broadcast_gps(dest.latitude, dest.longitude, alt_out, heading_deg)
 
     # Remove timing printouts
     # loop_end = time.perf_counter()
