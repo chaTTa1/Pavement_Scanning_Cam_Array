@@ -9,7 +9,8 @@ from geopy.distance import geodesic
 from geopy.point import Point
 import socket
 import json
-
+import subprocess
+import signal
 
 # Setup UDP broadcast socket
 UDP_IP = "192.168.1.255"  
@@ -22,6 +23,29 @@ l_dist = 0.6
 r_dist = 0.4
 CAMISLEFT_FLAG = False
 
+# Map roles to (username, IP) for each Jetson Nano
+jetsons = {
+    "left":  ("ryan4", "192.168.1.12"),
+    "mid":   ("ryan5", "192.168.1.11"),
+    "right": ("ryan6", "192.168.1.10"),
+}
+ssh_processes = {}
+
+for role, (username, ip) in jetsons.items():
+    try:
+        proc = subprocess.Popen(
+            [
+                "ssh", f"{username}@{ip}",
+                f"DEVICE_ROLE={role} python3 ~/Alex/Blackfly/blkfly.py"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        ssh_processes[role] = proc
+        print(f"[INFO] Launched {role} blkfly.py on {username}@{ip}")
+    except Exception as e:
+        print(f"[ERROR] Could not launch {role} on {ip}: {e}")
+
 def broadcast_all_camera_positions(left, mid, right, alt):
     message = {
         "left": {"lat": left[0], "lon": left[1], "alt": alt},
@@ -29,6 +53,19 @@ def broadcast_all_camera_positions(left, mid, right, alt):
         "right": {"lat": right[0], "lon": right[1], "alt": alt}
     }
     sock.sendto(json.dumps(message).encode(), (UDP_IP, UDP_PORT))
+
+def stop_all_jetson_scripts():
+    print("[INFO] Stopping blkfly.py scripts on Jetsons...")
+    for role, (username, ip) in jetsons.items():
+        try:
+            subprocess.run(
+                ["ssh", f"{username}@{ip}", "pkill -f blkfly.py"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            print(f"[INFO] Stopped {role} blkfly.py on {ip}")
+        except Exception as e:
+            print(f"[ERROR] Could not stop {role} on {ip}: {e}")
 
 def quaternion_propagate(q, omega, dt):
     """
@@ -99,9 +136,9 @@ ekf.R = np.eye(3) * 0.0001
 
 
 # --- Serial port setup ---
-IMU_PORT = 'COM3'
+IMU_PORT = '/dev/ttyACM0'
 IMU_BAUD = 115200
-GPS_PORT = 'COM10'
+GPS_PORT = '/dev/ttyACM2'
 GPS_BAUD = 115200
 
 imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0.01)
@@ -163,7 +200,7 @@ def read_gps_line(ser):
 
         if isinstance(msg, pynmea2.types.talker.GGA):
             # For debugging, you can uncomment the next line:
-            # print(f"[GGA] TOW: {msg.timestamp} | Lat: {msg.latitude}° | Lon: {msg.longitude}° | Alt: {msg.altitude} {msg.altitude_units}")
+            print(f"[GGA] TOW: {msg.timestamp} | Lat: {msg.latitude}° | Lon: {msg.longitude}° | Alt: {msg.altitude} {msg.altitude_units}")
             return float(msg.latitude), float(msg.longitude), float(msg.altitude)
 
         elif isinstance(msg, pynmea2.types.talker.HDT):
@@ -182,7 +219,7 @@ reference_gps_samples = []
 reference_gps_time = None
 REFERENCE_GPS_SAMPLE_COUNT = 10
 REFERENCE_GPS_STATIONARY_SECONDS = 2.0
-REFERENCE_GPS_POSITION_TOL = 0.000001  
+REFERENCE_GPS_POSITION_TOL = 0.00001  
 
 # Wait for first valid GPS fix to set reference_gps
 while reference_gps is None:
@@ -198,7 +235,7 @@ def convert_camera_gps(lat, lon, alt, heading_deg, camisleft_flag):
     # Camera offsets (meters)
     l_dist = 0.6
     r_dist = 0.4
-    m_dist = 0.1
+    m_dist = 0.05
 
     # Convert heading to radians
     heading = np.radians(heading_deg)
@@ -221,7 +258,7 @@ def convert_camera_gps(lat, lon, alt, heading_deg, camisleft_flag):
     left_point = geodesic(meters=np.sqrt(left_e**2 + left_n**2)).destination(ref_point, (np.degrees(np.arctan2(left_e, left_n)) % 360))
     mid_point = geodesic(meters=np.sqrt(mid_e**2 + mid_n**2)).destination(ref_point, (np.degrees(np.arctan2(mid_e, mid_n)) % 360))
     right_point = geodesic(meters=np.sqrt(right_e**2 + right_n**2)).destination(ref_point, (np.degrees(np.arctan2(right_e, right_n)) % 360))
-
+    #print(left_point, mid_point, right_point)
     return (
         (left_point.latitude, left_point.longitude),
         (mid_point.latitude, mid_point.longitude),
@@ -237,69 +274,73 @@ def broadcast_gps(lat, lon, alt, heading_deg):
 
 
 # --- Main fusion loop ---
-while True:
-    loop_start = time.perf_counter()
+try:    
+    while True:
+        loop_start = time.perf_counter()
 
-    # --- Read IMU ---
-    imu_packet = read_imu_packet(imu_ser)
-    if imu_packet is None:
-        continue
-    imu_timestamp, imu_data = imu_packet
+        # --- Read IMU ---
+        imu_packet = read_imu_packet(imu_ser)
+        if imu_packet is None:
+            continue
+        imu_timestamp, imu_data = imu_packet
 
-    # Compose IMU input for EKF (match field names from IMU_to_csv.py)
-    gyro = np.array([
-        imu_data.get('gyro_x', 0),
-        imu_data.get('gyro_y', 0),
-        imu_data.get('gyro_z', 0)
-    ])
-    acc = np.array([
-        imu_data.get('accel_x', 0),
-        imu_data.get('accel_y', 0),
-        imu_data.get('accel_z', 0)
-    ])
-    u = [gyro, acc]
+        # Compose IMU input for EKF (match field names from IMU_to_csv.py)
+        gyro = np.array([
+            imu_data.get('gyro_x', 0),
+            imu_data.get('gyro_y', 0),
+            imu_data.get('gyro_z', 0)
+        ])
+        acc = np.array([
+            imu_data.get('accel_x', 0),
+            imu_data.get('accel_y', 0),
+            imu_data.get('accel_z', 0)
+        ])
+        u = [gyro, acc]
 
-    # Time step
-    if last_imu_time is None:
+        # Time step
+        if last_imu_time is None:
+            last_imu_time = imu_timestamp
+            continue
+        dt = (imu_timestamp - last_imu_time) / 1e6
         last_imu_time = imu_timestamp
-        continue
-    dt = (imu_timestamp - last_imu_time) / 1e6
-    last_imu_time = imu_timestamp
 
-    # EKF predict (dead-reckoning)
-    ekf.x = fx(ekf.x, u, dt)
+        # EKF predict (dead-reckoning)
+        ekf.x = fx(ekf.x, u, dt)
 
-    # --- GPS update ---
-    gps_fix = read_gps_line(gps_ser)
-    if gps_fix is not None and reference_gps is not None:
-        lat, lon, alt = gps_fix
-        # Convert to ENU
-        e = geodesic((reference_gps[0], reference_gps[1]), (reference_gps[0], lon)).meters * (1 if lon >= reference_gps[1] else -1)
-        n = geodesic((reference_gps[0], reference_gps[1]), (lat, reference_gps[1])).meters * (1 if lat >= reference_gps[0] else -1)
-        u_ = alt - reference_gps[2]
-        # Directly set EKF position to GPS
-        ekf.x[0:3] = [e, n, u_]
+        # --- GPS update ---
+        gps_fix = read_gps_line(gps_ser)
+        if gps_fix is not None and reference_gps is not None:
+            lat, lon, alt = gps_fix
+            # Convert to ENU
+            e = geodesic((reference_gps[0], reference_gps[1]), (reference_gps[0], lon)).meters * (1 if lon >= reference_gps[1] else -1)
+            n = geodesic((reference_gps[0], reference_gps[1]), (lat, reference_gps[1])).meters * (1 if lat >= reference_gps[0] else -1)
+            u_ = alt - reference_gps[2]
+            # Directly set EKF position to GPS
+            ekf.x[0:3] = [e, n, u_]
 
-    # --- Output current state as GPS ---
-    if reference_gps is not None:
-        x, y, z_ = ekf.x[0:3]  # EKF position in meters (ENU)
-        flat_distance = np.sqrt(x**2 + y**2)
-        bearing = np.degrees(np.arctan2(x, y)) % 360  # East-North
-        ref_point = Point(reference_gps[0], reference_gps[1])
-        dest = geodesic(meters=flat_distance).destination(ref_point, bearing)
-        alt_out = reference_gps[2] + z_
-        heading_deg = bearing  # Use EKF bearing as heading
-        print(f"EKF GPS: lat={dest.latitude:.8f}, lon={dest.longitude:.8f}, alt={alt_out:.2f}")
-        broadcast_gps(dest.latitude, dest.longitude, alt_out, heading_deg)
+        # --- Output current state as GPS ---
+        if reference_gps is not None:
+            x, y, z_ = ekf.x[0:3]  # EKF position in meters (ENU)
+            flat_distance = np.sqrt(x**2 + y**2)
+            bearing = np.degrees(np.arctan2(x, y)) % 360  # East-North
+            ref_point = Point(reference_gps[0], reference_gps[1])
+            dest = geodesic(meters=flat_distance).destination(ref_point, bearing)
+            alt_out = reference_gps[2] + z_
+            heading_deg = bearing  # Use EKF bearing as heading
+            print(f"EKF GPS: lat={dest.latitude:.8f}, lon={dest.longitude:.8f}, alt={alt_out:.2f}")
+            broadcast_gps(dest.latitude, dest.longitude, alt_out, heading_deg)
 
-    # Remove timing printouts
-    # loop_end = time.perf_counter()
-    # loop_time = loop_end - loop_start
-    # predict_time = predict_end - predict_start
-    # if update_time is not None:
-    #     print(f"Loop: {loop_time1000:.2f} ms | Predict: {predict_time1000:.2f} ms | Update: {update_time*1000:.2f} ms")
-    # else:
-    #     print(f"Loop: {loop_time1000:.2f} ms | Predict: {predict_time1000:.2f} ms")
+        # Remove timing printouts
+        # loop_end = time.perf_counter()
+        # loop_time = loop_end - loop_start
+        # predict_time = predict_end - predict_start
+        # if update_time is not None:
+        #     print(f"Loop: {loop_time1000:.2f} ms | Predict: {predict_time1000:.2f} ms | Update: {update_time*1000:.2f} ms")
+        # else:
+        #     print(f"Loop: {loop_time1000:.2f} ms | Predict: {predict_time1000:.2f} ms")
 
-    # Sleep to avoid busy loop (optional)
-    time.sleep(0.001)
+        # Sleep to avoid busy loop (optional)
+        time.sleep(0.001)
+except KeyboardInterrupt:
+    print("\n[INFO] Caught Ctrl+C. Shutting down...")
+    stop_all_jetson_scripts()
