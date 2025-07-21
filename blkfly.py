@@ -8,31 +8,35 @@ Created on Tue Nov 12 14:00:33 2024
 
 # coding=utf-8
 import os
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+import cv2
 from tkinter import Image
 import PySpin
 import sys
-import cv2
+import time
 #import piexif
 #import usb.core
 #import lcpy
 import numpy as np
 from datetime import datetime, timezone
 from time import perf_counter_ns
-import piexif
+#import piexif
 from PIL import Image
 from exif import Image
 import threading
 import socket
 import json
-
+from fractions import Fraction
 # --- Camera identifier: set this for each camera script ---
-CAMERA_ID = "left"  # Change to "mid" or "right" for each camera
+CAMERA_ID = "mid"  # Change to "mid" or "right" for each camera
 
 latest_gps = { "lat": None, "lon": None, "alt": None }
 
 def gps_listener(udp_port=5005):
+    print(f"[gps_listener] Thread started on port {udp_port}")
     global latest_gps
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind(('', udp_port))
     while True:
@@ -44,6 +48,13 @@ def gps_listener(udp_port=5005):
         except Exception as e:
             print("GPS packet error:", e)
 
+def decimal_to_dms_precise(decimal):
+    degrees = abs(int(decimal))
+    minutes_float = abs((decimal - degrees) * 60)
+    minutes = int(minutes_float)
+    seconds = (minutes_float - minutes) * 60
+    return (degrees, minutes, round(seconds, 6))
+
 
 def get_tow_from_utc():
     # gps epoch: 1980-01-06 00:00:00 UTC
@@ -53,7 +64,7 @@ def get_tow_from_utc():
     tow = gps_seconds % (7 * 86400) # Time of Week (TOW) in seconds
     return round(tow, 4)
 
-def embed_tow_with_exif_module(image_path, tow_value):
+def embed_tow_with_exif_module(image_path, tow_value, latest_gps):
     with open(image_path, 'rb') as img_file:
         img = Image(img_file)
 
@@ -62,6 +73,19 @@ def embed_tow_with_exif_module(image_path, tow_value):
     img.make = "Flir"
     img.model = "Blackfly S"
     img.focal_length = "6"
+    if latest_gps and latest_gps["lat"] is not None and latest_gps["lon"] is not None:
+
+
+        lat_deg, lat_min, lat_sec = decimal_to_dms_precise(abs(latest_gps["lat"]))s
+        lon_deg, lon_min, lon_sec = decimal_to_dms_precise(abs(latest_gps["lon"]))
+        
+        img.gps_latitude = (lat_deg, lat_min, lat_sec)
+        img.gps_latitude_ref ='N'
+        img.gps_longitude = (lon_deg, lon_min, lon_sec)
+        img.gps_longitude_ref = 'W'
+        img.gps_altitude = decimal_to_dms_precise(latest_gps["alt"])
+        img.gps_altitude_ref = 0
+    
 
 
     with open(image_path, 'wb') as new_file:
@@ -236,6 +260,7 @@ def acquire_images(cam,
     nodemap = cam.GetNodeMap()
     nodemap_tldevice = cam.GetTLDeviceNodeMap()
     s_node_map = cam.GetTLStreamNodeMap()
+    global latest_gps
     
     if verbose:
         print_device_info(nodemap_tldevice)
@@ -276,13 +301,14 @@ def acquire_images(cam,
             cv2.imwrite(save_path, frame)
             #write TOW to exif data
             tow = get_tow_from_utc()
-            embed_tow_with_exif_module(save_path, tow)
+            embed_tow_with_exif_module(save_path, tow, latest_gps)
+            #embed_gps_with_exif(save_path, latest_gps)
 
             count += 1
 
             # Display preview
             img_show = cv2.resize(frame, None, fx=0.5, fy=0.5)
-            cv2.imshow("Press 'q' to stop", img_show)
+            #cv2.imshow("Press 'q' to stop", img_show)
             
             # Exit on 'q' key
             if cv2.waitKey(1) == ord('q'):
@@ -1288,9 +1314,13 @@ def print_trigger_config(nodemap, s_node_map, triggerType="software"):
 
 def main():
     # Start GPS listener thread
-    gps_thread = threading.Thread(target=gps_listener, daemon=True)
+    print("[main] Launching gps_listener thread...")
+    print("[main] Threads before GPS start:", [t.name for t in threading.enumerate()])
+    gps_thread = threading.Thread(target=gps_listener, name="GPS-Listener", daemon=True)
     gps_thread.start()
-
+    time.sleep(5)
+    print("[main] Threads after GPS start: ", [t.name for t in threading.enumerate()])
+    print(latest_gps)
     acquisition_index = 0
     num_images = 15
     triggerType = "Off"
@@ -1298,7 +1328,7 @@ def main():
 
     if result:
         # Run example on each camera
-        savedir = r"C:\Users\alexc\Documents\Research\Summer25_Img\TimestampTest2"
+        savedir = r"/home/ryan5/Alex/Blackfly/test_july15"
         clearDir(savedir)
         for i, cam in enumerate(cam_list):
             print('Running example for camera %d...' % i)
@@ -1307,7 +1337,7 @@ def main():
                                         acquisition_index=acquisition_index,
                                         num_images=num_images,
                                         triggerType=triggerType,
-                                        exposureTime=50)
+                                        exposureTime=3000)
             print('Camera %d example complete...' % i)
 
         # Release reference to camera
