@@ -142,7 +142,7 @@ def cam_configuration(nodemap,
                       s_node_map,
                       frameRate=200,
                       pgrExposureCompensation=0,
-                      exposureTime=3000,
+                      exposureTime="auto",
                       gain=0,
                       blackLevel=0,
                       bufferCount=30,
@@ -193,8 +193,13 @@ def cam_configuration(nodemap,
     # if pgrExposureCompensation is not None:
     #     result &= setExposureCompensation(nodemap, pgrExposureCompensation=pgrExposureCompensation)
     ## find exposure mode
-    if exposureTime is not None:
+
+    # --- CHANGED SECTION ---
+    if isinstance(exposureTime, str) and exposureTime.lower() == "auto":
+        result &= enableExposureAuto(nodemap)
+    elif exposureTime is not None:
         result &= setExposureTime(nodemap, exposureTime=exposureTime)
+
     if gain is not None:
         result &= setGain(nodemap, gain=gain)
     if blackLevel is not None:
@@ -440,7 +445,7 @@ def run_single_camera(cam,
                       num_images,
                       triggerType,
                       frameRate=200,
-                      exposureTime=3000,
+                      exposureTime="auto",
                       gain=0,
                       bufferCount=30,
                       timeout=10):
