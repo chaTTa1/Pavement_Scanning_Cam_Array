@@ -11,7 +11,7 @@ import socket
 import json
 import subprocess
 import signal
-
+import pandas as pd
 # Setup UDP broadcast socket
 UDP_IP = "192.168.1.255"  
 UDP_PORT = 5005
@@ -46,14 +46,54 @@ for role, (username, ip) in jetsons.items():
     except Exception as e:
         print(f"[ERROR] Could not launch {role} on {ip}: {e}")
 
+def log_gps_error(time_err, lat_err, lon_err, alt_err):
+    """
+    Log GPS accuracy errors to a csv file.
+    Args:
+        lat_err (float): Latitude error in meters.
+        lon_err (float): Longitude error in meters.
+        alt_err (float): Altitude error in meters.
+    Output:
+        Appends a new line to 'gps_accuracy_log.csv' with the current timestamp and errors.
+    """
+    if lat_err is None or lon_err is None or alt_err is None:
+        return
+    data = {
+        'timestamp': pd.Timestamp.now(),
+        'lat_error': lat_err,
+        'lon_error': lon_err,
+        'alt_error': alt_err
+    }
+    df = pd.DataFrame([data])
+    df.to_csv('gps_accuracy_log.csv', mode='a', header=not pd.io.common.file_exists('gps_accuracy_log.csv'), index=False)
+    return
+
+
 def broadcast_all_camera_positions(left, mid, right, alt):
     message = {
         "left": {"lat": left[0], "lon": left[1], "alt": alt},
         "mid": {"lat": mid[0], "lon": mid[1], "alt": alt},
-        "right": {"lat": right[0], "lon": right[1], "alt": alt}
+        "right": {"lat": right[0], "lon": right[1], "alt": alt},
+        "timestamp": time.time()  # Add send timestamp
     }
+    start_time = time.perf_counter()
     sock.sendto(json.dumps(message).encode(), (UDP_IP, UDP_PORT))
 
+    # Wait for ACK (optional: set a timeout)
+    sock.settimeout(1.0)
+    try:
+        data, addr = sock.recvfrom(1024)
+        ack = json.loads(data.decode())
+        if "timestamp" in ack:
+            rtt = (time.time() - ack["timestamp"]) * 1000  # ms
+            print(f"[TIMER] RTT to {addr}: {rtt:.2f} ms")
+    except socket.timeout:
+        print("[WARN] No ACK received")
+    end_time = time.perf_counter()
+    elapsed_ms = (end_time - start_time) * 1000
+    df = pd.DataFrame([elapsed_ms], columns=['elapsed_ms'])
+    df.to_csv('udp_broadcast_log.csv', mode='a', header=not pd.io.common.file_exists('udp_broadcast_log.csv'), index=False)
+    
 def stop_all_jetson_scripts():
     print("[INFO] Stopping blkfly.py scripts on Jetsons...")
     for role, (username, ip) in jetsons.items():
@@ -207,8 +247,13 @@ def read_gps_line(ser):
             # print(f"[HDT] Heading: {msg.heading}°")
             return None
 
-        elif isinstance(msg, pynmea2.types.talker.RMC):
-            # print(f"[RMC] Time: {msg.timestamp}, Date: {msg.datestamp}")
+        elif isinstance(msg, pynmea2.types.talker.GST):
+            time_err = msg.timestamp if msg.timestamp else None
+            lat_err = float(msg.data[5]) if msg.data[5] else None
+            lon_err = float(msg.data[6]) if msg.data[6] else None
+            alt_err = float(msg.data[7]) if msg.data[7] else None
+            print(f"[GST] Lat Error: {lat_err} m | Lon Error: {lon_err} m | Alt Error: {alt_err} m | time: {time_err} s")
+            log_gps_error(time_err, lat_err, lon_err, alt_err)
             return None
 
     except pynmea2.ParseError:

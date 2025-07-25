@@ -1,5 +1,29 @@
 import pynmea2
 import serial
+import pandas as pd
+
+def log_gps_error(lat_err, lon_err, alt_err):
+    """
+    Log GPS accuracy errors to a csv file.
+    Args:
+        lat_err (float): Latitude error in meters.
+        lon_err (float): Longitude error in meters.
+        alt_err (float): Altitude error in meters.
+    Output:
+        Appends a new line to 'gps_accuracy_log.csv' with the current timestamp and errors.
+    """
+    if lat_err is None or lon_err is None or alt_err is None:
+        return
+    data = {
+        'timestamp': pd.Timestamp.now(),
+        'lat_error': lat_err,
+        'lon_error': lon_err,
+        'alt_error': alt_err
+    }
+    df = pd.DataFrame([data])
+    df.to_csv('gps_accuracy_log.csv', mode='a', header=not pd.io.common.file_exists('gps_accuracy_log.csv'), index=False)
+    return
+
 
 def read_gps_line(ser):
     """
@@ -30,27 +54,17 @@ def read_gps_line(ser):
         elif isinstance(msg, pynmea2.types.talker.GST):
             # GST fields: [timestamp, rms, semi-major, semi-minor, orientation, lat_err, lon_err, alt_err]
             # Indices:      0         1    2          3          4           5        6        7
+            time_err = msg.timestamp if msg.timestamp else None
             lat_err = float(msg.data[5]) if msg.data[5] else None
             lon_err = float(msg.data[6]) if msg.data[6] else None
             alt_err = float(msg.data[7]) if msg.data[7] else None
-            rms = float(msg.data[1]) if msg.data[1] else None
-            print(f"[GST] Lat Error: {lat_err} m | Lon Error: {lon_err} m | Alt Error: {alt_err} m | RMS: {rms} m")
+            print(f"[GST] Lat Error: {lat_err} m | Lon Error: {lon_err} m | Alt Error: {alt_err} m | time: {time_err} m")
+            log_gps_error(time_err, lat_err, lon_err, alt_err)
             return {
                 'type': 'GST',
                 'lat_err': lat_err,
                 'lon_err': lon_err,
                 'alt_err': alt_err,
-                'rms': rms,
-            }
-
-        # --- Dilution of Precision (GSA) ---
-        elif isinstance(msg, pynmea2.types.talker.GSA):
-            print(f"[GSA] HDOP: {msg.hdop} | VDOP: {msg.vdop} | PDOP: {msg.pdop}")
-            return {
-                'type': 'GSA',
-                'hdop': float(msg.hdop) if msg.hdop else None,
-                'vdop': float(msg.vdop) if msg.vdop else None,
-                'pdop': float(msg.pdop) if msg.pdop else None,
             }
 
         # --- Heading (HDT) ---
