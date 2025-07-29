@@ -10,7 +10,7 @@ Created on Tue Nov 12 14:00:33 2024
 import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import cv2
-from tkinter import Image
+#from tkinter import Image
 import PySpin
 import sys
 import time
@@ -21,7 +21,7 @@ import numpy as np
 from datetime import datetime, timezone
 from time import perf_counter_ns
 #import piexif
-from PIL import Image
+#from PIL import Image
 from exif import Image
 import threading
 import socket
@@ -74,18 +74,14 @@ def embed_tow_with_exif_module(image_path, tow_value, latest_gps):
     img.model = "Blackfly S"
     img.focal_length = "6"
     if latest_gps and latest_gps["lat"] is not None and latest_gps["lon"] is not None:
-
-
-        lat_deg, lat_min, lat_sec = decimal_to_dms_precise(abs(latest_gps["lat"]))s
+        lat_deg, lat_min, lat_sec = decimal_to_dms_precise(abs(latest_gps["lat"]))
         lon_deg, lon_min, lon_sec = decimal_to_dms_precise(abs(latest_gps["lon"]))
-        
         img.gps_latitude = (lat_deg, lat_min, lat_sec)
         img.gps_latitude_ref ='N'
         img.gps_longitude = (lon_deg, lon_min, lon_sec)
         img.gps_longitude_ref = 'W'
         img.gps_altitude = decimal_to_dms_precise(latest_gps["alt"])
         img.gps_altitude_ref = 0
-    
 
 
     with open(image_path, 'wb') as new_file:
@@ -140,7 +136,7 @@ def capture_image(cam, timeout=10000, save_path=None, return_array=True):
 
 def cam_configuration(nodemap,
                       s_node_map,
-                      frameRate=200,
+                      frameRate=1,
                       pgrExposureCompensation=0,
                       exposureTime="auto",
                       gain=0,
@@ -186,20 +182,15 @@ def cam_configuration(nodemap,
     # TODO:
     ## find frame rate
     # if frameRate is not None:
-    #     result &= setFrameRate(nodemap, frameRate=frameRate)
+    result &= setFrameRate(nodemap, frameRate=frameRate)
     # ExposureCompensationAuto = get_IEnumeration_node_current_entry_name(nodemap, 'pgrExposureCompensationAuto', verbose=False)
     # if not (ExposureCompensationAuto == 'Off'):
     #     result &= disableExposureCompensationAuto(nodemap)
     # if pgrExposureCompensation is not None:
     #     result &= setExposureCompensation(nodemap, pgrExposureCompensation=pgrExposureCompensation)
     ## find exposure mode
-
-    # --- CHANGED SECTION ---
-    if isinstance(exposureTime, str) and exposureTime.lower() == "auto":
-        result &= enableExposureAuto(nodemap)
-    elif exposureTime is not None:
+    if exposureTime is not None:
         result &= setExposureTime(nodemap, exposureTime=exposureTime)
-
     if gain is not None:
         result &= setGain(nodemap, gain=gain)
     if blackLevel is not None:
@@ -219,7 +210,7 @@ def acquire_images(cam,
                    savedir,
                    triggerType,
                    frameRate=200,
-                   exposureTime=3000,
+                   exposureTime="auto",
                    gain=0,
                    blackLevel=0,
                    bufferCount=30,
@@ -301,7 +292,7 @@ def acquire_images(cam,
                 continue
 
             # Save every frame (or use `if count % 5 == 0` to save every 5th frame)
-            filename = f'frame_{count:06d}.jpg'
+            filename = f'mid_frame_{count:06d}.jpg'
             save_path = os.path.join(savedir, filename)
             cv2.imwrite(save_path, frame)
             #write TOW to exif data
@@ -444,8 +435,8 @@ def run_single_camera(cam,
                       acquisition_index,
                       num_images,
                       triggerType,
-                      frameRate=200,
-                      exposureTime="auto",
+                      frameRate=0.5,
+                      exposureTime=3000,
                       gain=0,
                       bufferCount=30,
                       timeout=10):
@@ -1342,7 +1333,7 @@ def main():
                                         acquisition_index=acquisition_index,
                                         num_images=num_images,
                                         triggerType=triggerType,
-                                        exposureTime=3000)
+                                        exposureTime="auto")
             print('Camera %d example complete...' % i)
 
         # Release reference to camera
@@ -1416,6 +1407,4 @@ if __name__ == '__main__':
 # bufferCount=15
 # timeout=10
 # verbose=True
-
-
 

@@ -10,15 +10,17 @@ from geopy.point import Point
 import socket
 import json
 import subprocess
-import signal
 import pandas as pd
+import os
+
 # Setup UDP broadcast socket
-UDP_IP = "192.168.1.255"  
+UDP_IP = "192.168.1.255"
 UDP_PORT = 5005
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-m_dist = 0.1
+# Camera hardware configuration
+m_dist = 0.01
 l_dist = 0.6
 r_dist = 0.4
 CAMISLEFT_FLAG = False
@@ -29,8 +31,10 @@ jetsons = {
     "mid":   ("ryan5", "192.168.1.11"),
     "right": ("ryan6", "192.168.1.10"),
 }
-ssh_processes = {}
 
+# --- SSH Process Management ---
+ssh_processes = {}
+print("[INFO] Launching blkfly.py scripts on all Jetsons...")
 for role, (username, ip) in jetsons.items():
     try:
         proc = subprocess.Popen(
@@ -46,346 +50,225 @@ for role, (username, ip) in jetsons.items():
     except Exception as e:
         print(f"[ERROR] Could not launch {role} on {ip}: {e}")
 
-def log_gps_error(time_err, lat_err, lon_err, alt_err):
-    """
-    Log GPS accuracy errors to a csv file.
-    Args:
-        lat_err (float): Latitude error in meters.
-        lon_err (float): Longitude error in meters.
-        alt_err (float): Altitude error in meters.
-    Output:
-        Appends a new line to 'gps_accuracy_log.csv' with the current timestamp and errors.
-    """
-    if lat_err is None or lon_err is None or alt_err is None:
-        return
-    data = {
-        'timestamp': pd.Timestamp.now(),
-        'lat_error': lat_err,
-        'lon_error': lon_err,
-        'alt_error': alt_err
-    }
-    df = pd.DataFrame([data])
-    df.to_csv('gps_accuracy_log.csv', mode='a', header=not pd.io.common.file_exists('gps_accuracy_log.csv'), index=False)
-    return
-
-
-def broadcast_all_camera_positions(left, mid, right, alt):
-    message = {
-        "left": {"lat": left[0], "lon": left[1], "alt": alt},
-        "mid": {"lat": mid[0], "lon": mid[1], "alt": alt},
-        "right": {"lat": right[0], "lon": right[1], "alt": alt},
-        "timestamp": time.time()  # Add send timestamp
-    }
-    start_time = time.perf_counter()
-    sock.sendto(json.dumps(message).encode(), (UDP_IP, UDP_PORT))
-
-    # Wait for ACK (optional: set a timeout)
-    sock.settimeout(1.0)
-    try:
-        data, addr = sock.recvfrom(1024)
-        ack = json.loads(data.decode())
-        if "timestamp" in ack:
-            rtt = (time.time() - ack["timestamp"]) * 1000  # ms
-            print(f"[TIMER] RTT to {addr}: {rtt:.2f} ms")
-    except socket.timeout:
-        print("[WARN] No ACK received")
-    end_time = time.perf_counter()
-    elapsed_ms = (end_time - start_time) * 1000
-    df = pd.DataFrame([elapsed_ms], columns=['elapsed_ms'])
-    df.to_csv('udp_broadcast_log.csv', mode='a', header=not pd.io.common.file_exists('udp_broadcast_log.csv'), index=False)
-    
 def stop_all_jetson_scripts():
     print("[INFO] Stopping blkfly.py scripts on Jetsons...")
     for role, (username, ip) in jetsons.items():
         try:
             subprocess.run(
                 ["ssh", f"{username}@{ip}", "pkill -f blkfly.py"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                check=True,
+                capture_output=True, text=True
             )
             print(f"[INFO] Stopped {role} blkfly.py on {ip}")
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Failed to stop {role} on {ip}: {e.stderr}")
         except Exception as e:
             print(f"[ERROR] Could not stop {role} on {ip}: {e}")
 
+# --- EKF Helper Functions ---
 def quaternion_propagate(q, omega, dt):
-    """
-    Propagate quaternion with angular velocity omega over dt
-    """
     r = R.from_quat(q)
     delta_r = R.from_rotvec(omega * dt)
     new_r = r * delta_r
     return new_r.as_quat()
 
-
-def fx(x, u, dt):
-    """
-    State transition function
-    x: state vector [pos, vel, quat, gyro_bias, acc_bias]
-    u: control input [gyro_raw, acc_raw]
-    """
-    pos = x[0:3]
-    vel = x[3:6]
-    quat = x[6:10]
-    b_g = x[10:13]
-    b_a = x[13:16]
-
-    gyro = u[0] - b_g
-    acc = u[1] - b_a
-
+def fx(x, dt, u):
+    pos, vel, quat, b_g, b_a = x[0:3], x[3:6], x[6:10], x[10:13], x[13:16]
+    gyro = u[:3] - b_g
+    acc = u[3:6] - b_a
     quat = quat / np.linalg.norm(quat)
     r = R.from_quat(quat)
     acc_world = r.apply(acc)
-    acc_world[2] -= 9.81  # remove gravity
-
+    acc_world[2] -= 9.81
     new_pos = pos + vel * dt + 0.5 * acc_world * dt**2
     new_vel = vel + acc_world * dt
     new_quat = quaternion_propagate(quat, gyro, dt)
-
-    # Bias random walk (allow filter to adapt)
-    new_b_g = b_g  # Optionally: + np.random.normal(0, 0.001, 3) * dt
-    new_b_a = b_a  # Optionally: + np.random.normal(0, 0.01, 3) * dt
-
     x_new = np.zeros(16)
-    x_new[0:3] = new_pos
-    x_new[3:6] = new_vel
-    x_new[6:10] = new_quat
-    x_new[10:13] = new_b_g
-    x_new[13:16] = new_b_a
+    x_new[0:3], x_new[3:6], x_new[6:10], x_new[10:13], x_new[13:16] = new_pos, new_vel, new_quat, b_g, b_a
     return x_new
 
-
 def hx(x):
-    return x[0:3]  # GPS measures position only
-
+    return x[0:3]
 
 def H_jacobian(x):
     H = np.zeros((3, 16))
     H[:, :3] = np.eye(3)
     return H
 
+# --- Logging ---
+def log_position_and_error(timestamp, gps_pos, gps_error=None):
+    data = {'timestamp': timestamp, 'lat': gps_pos[0], 'lon': gps_pos[1], 'alt': gps_pos[2]}
+    if gps_error:
+        data.update({'lat_err': gps_error[0], 'lon_err': gps_error[1], 'alt_err': gps_error[2]})
+    df = pd.DataFrame([data])
+    df.to_csv('position_log.csv', mode='a', header=not os.path.exists('position_log.csv'), index=False)
 
-# Initialize EKF
-ekf = ExtendedKalmanFilter(dim_x=16, dim_z=3)
-ekf.x = np.zeros(16)
-ekf.x[6] = 1.0  # Initialize quaternion to identity
-ekf.P = np.eye(16) * 100
-ekf.Q = np.eye(16) * 10.0
-ekf.Q[10:13, 10:13] = np.eye(3) * 0.01  # gyro bias
-ekf.Q[13:16, 13:16] = np.eye(3) * 2.0  # or even higher
-ekf.R = np.eye(3) * 0.0001
+# --- Sensor Fusion Class ---
+class SensorFusionEKF:
+    def __init__(self):
+        self.ekf = ExtendedKalmanFilter(dim_x=16, dim_z=3)
+        self.ekf.x = np.zeros(16)
+        self.ekf.x[6] = 1.0
+        self.ekf.P = np.eye(16) * 100
+        self.ekf.Q = np.eye(16) * 0.1
+        self.ekf.Q[0:3, 0:3], self.ekf.Q[3:6, 3:6] = np.eye(3) * 0.01, np.eye(3) * 0.1
+        self.ekf.Q[6:10, 6:10], self.ekf.Q[10:13, 10:13] = np.eye(4) * 0.01, np.eye(3) * 0.001
+        self.ekf.Q[13:16, 13:16] = np.eye(3) * 0.01
+        self.ekf.R = np.eye(3) * 1.0
+        self.reference_gps = None
+        self.last_imu_time = None
+        self.dt = 0.01
 
+    def set_reference_gps(self, lat, lon, alt):
+        self.reference_gps = (lat, lon, alt if alt is not None else 0.0)
 
-# --- Serial port setup ---
-IMU_PORT = '/dev/ttyACM0'
-IMU_BAUD = 115200
-GPS_PORT = '/dev/ttyACM2'
-GPS_BAUD = 115200
+    def update_imu(self, gyro, accel, timestamp):
+        if self.last_imu_time is None:
+            self.last_imu_time = timestamp
+            return
+        dt = (timestamp - self.last_imu_time) / 1e6
+        self.last_imu_time, self.dt = timestamp, dt
+        u = np.concatenate([gyro, accel])
+        self.ekf.predict(fx=fx, dt=self.dt, u=u)
 
-imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0.01)
-gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.01)
+    def update_gps(self, lat, lon, alt):
+        if self.reference_gps is None: return
+        alt = alt if alt is not None else self.reference_gps[2]
+        try:
+            e = geodesic((self.reference_gps[0], self.reference_gps[1]), (self.reference_gps[0], lon)).meters * (1 if lon >= self.reference_gps[1] else -1)
+            n = geodesic((self.reference_gps[0], self.reference_gps[1]), (lat, self.reference_gps[1])).meters * (1 if lat >= self.reference_gps[0] else -1)
+            if abs(e) > 1000 or abs(n) > 1000:
+                print(f"Warning: Large ENU coordinates (e={e:.1f}, n={n:.1f}), skipping update")
+                return
+            u_coord = alt - self.reference_gps[2]
+            z = np.array([e, n, u_coord])
+            self.ekf.update(z, HJacobian=H_jacobian, Hx=hx)
+        except Exception as e:
+            print(f"GPS update error: {e}")
+            self.ekf.P[0:3, 0:3] = np.eye(3) * 100
 
-last_imu_time = None
+    def get_gps_position(self):
+        if self.reference_gps is None: return None
+        x, y, z = self.ekf.x[0:3]
+        try:
+            flat_distance = np.sqrt(x**2 + y**2)
+            bearing = np.degrees(np.arctan2(x, y)) % 360
+            ref_point = Point(self.reference_gps[0], self.reference_gps[1])
+            dest = geodesic(meters=flat_distance).destination(ref_point, bearing)
+            return dest.latitude, dest.longitude, self.reference_gps[2] + z
+        except Exception as e:
+            print(f"Position conversion error: {e}")
+            return None
 
-# --- IMU packet parsing (copied from IMU_to_csv.py) ---
-CMD_QUATERNION = 32
-CMD_RPY = 35
-CMD_RAW = 41
+# --- Serial & Parsing ---
+IMU_PORT, GPS_PORT = 'COM3', 'COM10'
+IMU_BAUD, GPS_BAUD = 115200, 115200
 
-def parse_packet(cmd_id, payload):
-    if cmd_id == CMD_QUATERNION:
-        timestamp, q1, q2, q3, q4 = struct.unpack('<Iffff', payload)
-        return timestamp, {'q1': q1, 'q2': q2, 'q3': q3, 'q4': q4}
-    elif cmd_id == CMD_RPY:
-        timestamp, roll, pitch, yaw = struct.unpack('<Ifff', payload)
-        return timestamp, {'roll': roll, 'pitch': pitch, 'yaw': yaw}
-    elif cmd_id == CMD_RAW:
-        vals = struct.unpack('<Ifff fff fff', payload)
-        return vals[0], {
-            'accel_x': vals[1], 'accel_y': vals[2], 'accel_z': vals[3],
-            'gyro_x': vals[4], 'gyro_y': vals[5], 'gyro_z': vals[6],
-            'mag_x': vals[7], 'mag_y': vals[8], 'mag_z': vals[9]
-        }
-    else:
-        return None, {}
-
-def read_imu_packet(ser):
+def parse_imu_packet(ser):
     while True:
-        if ser.read() != b'\xAA' or ser.read() != b'\x55':
-            continue
+        if ser.read() != b'\xAA' or ser.read() != b'\x55': continue
         length = ser.read(1)
-        if not length:
-            continue
-        length = length[0]
-        payload = ser.read(length)
-        crc = ser.read(2)
-        if len(payload) < 4:
-            continue
+        if not length: continue
+        payload = ser.read(length[0])
+        if len(payload) < 4: continue
         header = struct.unpack('<I', payload[:4])[0]
         cmd_id = header & 0x7F
-        timestamp, data = parse_packet(cmd_id, payload[4:])
-        if timestamp is None:
-            continue
-        return timestamp, data
+        if cmd_id == 41:
+            vals = struct.unpack('<Iffff' 'fff' 'fff', payload[4:])
+            return vals[0], {
+                'accel_x': vals[1], 'accel_y': vals[2], 'accel_z': vals[3],
+                'gyro_x': vals[4], 'gyro_y': vals[5], 'gyro_z': vals[6]
+            }
+        return None, {}
 
 def read_gps_line(ser):
-    """
-    Parse GPS data exactly as in Real_Time_Mosaic_Parser.py.
-    Returns (lat, lon, alt) if GGA sentence, else None.
-    """
     line = ser.readline().decode('ascii', errors='ignore').strip()
-    if not line.startswith('$'):
-        return None
+    if not line.startswith('$'): return None
     try:
         msg = pynmea2.parse(line)
-
         if isinstance(msg, pynmea2.types.talker.GGA):
-            # For debugging, you can uncomment the next line:
-            print(f"[GGA] TOW: {msg.timestamp} | Lat: {msg.latitude}° | Lon: {msg.longitude}° | Alt: {msg.altitude} {msg.altitude_units}")
-            return float(msg.latitude), float(msg.longitude), float(msg.altitude)
-
-        elif isinstance(msg, pynmea2.types.talker.HDT):
-            # print(f"[HDT] Heading: {msg.heading}°")
-            return None
-
+            return {'type': 'GGA', 'lat': float(msg.latitude), 'lon': float(msg.longitude), 'alt': float(msg.altitude) if msg.altitude else None}
         elif isinstance(msg, pynmea2.types.talker.GST):
-            time_err = msg.timestamp if msg.timestamp else None
-            lat_err = float(msg.data[5]) if msg.data[5] else None
-            lon_err = float(msg.data[6]) if msg.data[6] else None
-            alt_err = float(msg.data[7]) if msg.data[7] else None
-            print(f"[GST] Lat Error: {lat_err} m | Lon Error: {lon_err} m | Alt Error: {alt_err} m | time: {time_err} s")
-            log_gps_error(time_err, lat_err, lon_err, alt_err)
-            return None
-
+            return {'type': 'GST', 'lat_err': float(msg.data[5]), 'lon_err': float(msg.data[6]), 'alt_err': float(msg.data[7])}
     except pynmea2.ParseError:
         return None
 
-reference_gps = None
-reference_gps_samples = []
-reference_gps_time = None
-REFERENCE_GPS_SAMPLE_COUNT = 10
-REFERENCE_GPS_STATIONARY_SECONDS = 2.0
-REFERENCE_GPS_POSITION_TOL = 0.00001  
-
-# Wait for first valid GPS fix to set reference_gps
-while reference_gps is None:
-    gps_fix = read_gps_line(gps_ser)
-    if gps_fix is not None:
-        reference_gps = gps_fix
-        print(f"Reference GPS set: {reference_gps}")
-
-def convert_camera_gps(lat, lon, alt, heading_deg, camisleft_flag):
-    """
-    Converts main GPS + heading to left/mid/right camera GPS positions.
-    """
-    # Camera offsets (meters)
-    l_dist = 0.6
-    r_dist = 0.4
-    m_dist = 0.05
-
-    # Convert heading to radians
+# --- Camera Position Calculation and Broadcasting ---
+def convert_camera_gps(lat, lon, alt, heading_deg):
     heading = np.radians(heading_deg)
-
-    # Calculate ENU offsets for each camera
-    # Left camera
-    left_e = l_dist * np.sin(heading)
-    left_n = l_dist * np.cos(heading)
-    # Mid camera
-    mid_e = m_dist * np.sin(heading)
-    mid_n = m_dist * np.cos(heading)
-    # Right camera
-    right_e = r_dist * np.sin(heading)
-    right_n = r_dist * np.cos(heading)
-
-    # Reference point
     ref_point = Point(lat, lon)
+    positions = {}
+    offsets = {"left": l_dist, "mid": m_dist, "right": r_dist}
+    for name, dist in offsets.items():
+        e, n = dist * np.sin(heading), dist * np.cos(heading)
+        dest = geodesic(meters=np.sqrt(e**2 + n**2)).destination(ref_point, (np.degrees(np.arctan2(e, n)) % 360))
+        positions[name] = {"lat": dest.latitude, "lon": dest.longitude, "alt": alt}
+    return positions
 
-    # Calculate GPS positions using geopy
-    left_point = geodesic(meters=np.sqrt(left_e**2 + left_n**2)).destination(ref_point, (np.degrees(np.arctan2(left_e, left_n)) % 360))
-    mid_point = geodesic(meters=np.sqrt(mid_e**2 + mid_n**2)).destination(ref_point, (np.degrees(np.arctan2(mid_e, mid_n)) % 360))
-    right_point = geodesic(meters=np.sqrt(right_e**2 + right_n**2)).destination(ref_point, (np.degrees(np.arctan2(right_e, right_n)) % 360))
-    #print(left_point, mid_point, right_point)
-    return (
-        (left_point.latitude, left_point.longitude),
-        (mid_point.latitude, mid_point.longitude),
-        (right_point.latitude, right_point.longitude)
-    )
+def broadcast_all_camera_positions(fused_pos, heading_deg):
+    lat, lon, alt = fused_pos
+    positions = convert_camera_gps(lat, lon, alt, heading_deg)
+    message = {**positions, "timestamp": time.time()}
+    sock.sendto(json.dumps(message).encode(), (UDP_IP, UDP_PORT))
 
-def broadcast_gps(lat, lon, alt, heading_deg):
-    """
-    Broadcasts all three camera GPS positions.
-    """
-    left, mid, right = convert_camera_gps(lat, lon, alt, heading_deg, CAMISLEFT_FLAG)
-    broadcast_all_camera_positions(left, mid, right, alt)
+# --- Main Execution ---
+def main():
+    ekf_fusion = SensorFusionEKF()
+    try:
+        imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0.01)
+        gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.01)
+    except serial.SerialException as e:
+        print(f"Failed to open serial ports: {e}")
+        return
 
+    print("Waiting for initial GPS fix to set reference...")
+    while ekf_fusion.reference_gps is None:
+        gps_data = read_gps_line(gps_ser)
+        if gps_data and gps_data.get('type') == 'GGA' and gps_data.get('lat', 0) != 0.0:
+            ekf_fusion.set_reference_gps(gps_data['lat'], gps_data['lon'], gps_data['alt'])
+            print(f"Reference GPS set: {ekf_fusion.reference_gps}")
 
-# --- Main fusion loop ---
-try:    
-    while True:
-        loop_start = time.perf_counter()
+    print("Starting sensor fusion and broadcasting loop...")
+    last_gps_error = None
+    try:
+        while True:
+            # IMU Update
+            imu_timestamp, imu_data = parse_imu_packet(imu_ser)
+            if imu_data:
+                gyro = np.array([imu_data.get(f'gyro_{axis}', 0) for axis in 'xyz'])
+                accel = np.array([imu_data.get(f'accel_{axis}', 0) for axis in 'xyz'])
+                ekf_fusion.update_imu(gyro, accel, imu_timestamp)
 
-        # --- Read IMU ---
-        imu_packet = read_imu_packet(imu_ser)
-        if imu_packet is None:
-            continue
-        imu_timestamp, imu_data = imu_packet
+            # GPS Update
+            gps_data = read_gps_line(gps_ser)
+            if gps_data:
+                if gps_data['type'] == 'GGA':
+                    ekf_fusion.update_gps(gps_data['lat'], gps_data['lon'], gps_data['alt'])
+                elif gps_data['type'] == 'GST':
+                    last_gps_error = (gps_data['lat_err'], gps_data['lon_err'], gps_data['alt_err'])
 
-        # Compose IMU input for EKF (match field names from IMU_to_csv.py)
-        gyro = np.array([
-            imu_data.get('gyro_x', 0),
-            imu_data.get('gyro_y', 0),
-            imu_data.get('gyro_z', 0)
-        ])
-        acc = np.array([
-            imu_data.get('accel_x', 0),
-            imu_data.get('accel_y', 0),
-            imu_data.get('accel_z', 0)
-        ])
-        u = [gyro, acc]
+            # Get fused position and broadcast
+            fused_pos = ekf_fusion.get_gps_position()
+            if fused_pos:
+                # Use EKF bearing for heading
+                x, y, _ = ekf_fusion.ekf.x[0:3]
+                heading_deg = np.degrees(np.arctan2(x, y)) % 360
+                print(f"EKF GPS: lat={fused_pos[0]:.8f}, lon={fused_pos[1]:.8f}, alt={fused_pos[2]:.2f}")
+                broadcast_all_camera_positions(fused_pos, heading_deg)
+                log_position_and_error(pd.Timestamp.now(), fused_pos, gps_error=last_gps_error)
+                last_gps_error = None # Reset error after logging
 
-        # Time step
-        if last_imu_time is None:
-            last_imu_time = imu_timestamp
-            continue
-        dt = (imu_timestamp - last_imu_time) / 1e6
-        last_imu_time = imu_timestamp
+            time.sleep(0.001)
 
-        # EKF predict (dead-reckoning)
-        ekf.x = fx(ekf.x, u, dt)
+    except KeyboardInterrupt:
+        print("\n[INFO] Shutdown initiated by user.")
+    except Exception as e:
+        print(f"[ERROR] An unexpected error occurred in the main loop: {e}")
+    finally:
+        stop_all_jetson_scripts()
+        imu_ser.close()
+        gps_ser.close()
+        print("Serial ports closed. Shutdown complete.")
 
-        # --- GPS update ---
-        gps_fix = read_gps_line(gps_ser)
-        if gps_fix is not None and reference_gps is not None:
-            lat, lon, alt = gps_fix
-            # Convert to ENU
-            e = geodesic((reference_gps[0], reference_gps[1]), (reference_gps[0], lon)).meters * (1 if lon >= reference_gps[1] else -1)
-            n = geodesic((reference_gps[0], reference_gps[1]), (lat, reference_gps[1])).meters * (1 if lat >= reference_gps[0] else -1)
-            u_ = alt - reference_gps[2]
-            # Directly set EKF position to GPS
-            ekf.x[0:3] = [e, n, u_]
-
-        # --- Output current state as GPS ---
-        if reference_gps is not None:
-            x, y, z_ = ekf.x[0:3]  # EKF position in meters (ENU)
-            flat_distance = np.sqrt(x**2 + y**2)
-            bearing = np.degrees(np.arctan2(x, y)) % 360  # East-North
-            ref_point = Point(reference_gps[0], reference_gps[1])
-            dest = geodesic(meters=flat_distance).destination(ref_point, bearing)
-            alt_out = reference_gps[2] + z_
-            heading_deg = bearing  # Use EKF bearing as heading
-            print(f"EKF GPS: lat={dest.latitude:.8f}, lon={dest.longitude:.8f}, alt={alt_out:.2f}")
-            broadcast_gps(dest.latitude, dest.longitude, alt_out, heading_deg)
-
-        # Remove timing printouts
-        # loop_end = time.perf_counter()
-        # loop_time = loop_end - loop_start
-        # predict_time = predict_end - predict_start
-        # if update_time is not None:
-        #     print(f"Loop: {loop_time1000:.2f} ms | Predict: {predict_time1000:.2f} ms | Update: {update_time*1000:.2f} ms")
-        # else:
-        #     print(f"Loop: {loop_time1000:.2f} ms | Predict: {predict_time1000:.2f} ms")
-
-        # Sleep to avoid busy loop (optional)
-        time.sleep(0.001)
-except KeyboardInterrupt:
-    print("\n[INFO] Caught Ctrl+C. Shutting down...")
-    stop_all_jetson_scripts()
+if __name__ == "__main__":
+    main()
