@@ -125,7 +125,7 @@ def create_geotag_plot(image_directory, output_filename='geotag_plot.png'):
 
 if __name__ == '__main__':
 
-    path_to_your_images = 'C:\\Users\\drone\\Documents\\Demos\\test_july22'
+    path_to_your_images = r"C:\Users\drone\Documents\Demos\test_july31"
     
     # On Windows: path_to_your_images = 'C:\\Users\\YourUser\\Pictures\\Vacation'
     # On macOS/Linux: path_to_your_images = '/home/YourUser/Pictures/Vacation'

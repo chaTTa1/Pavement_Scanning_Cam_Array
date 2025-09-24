@@ -10,7 +10,7 @@ Created on Tue Nov 12 14:00:33 2024
 import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import cv2
-#from tkinter import Image
+from tkinter import Image
 import PySpin
 import sys
 import time
@@ -21,7 +21,7 @@ import numpy as np
 from datetime import datetime, timezone
 from time import perf_counter_ns
 #import piexif
-#from PIL import Image
+from PIL import Image
 from exif import Image
 import threading
 import socket
@@ -74,14 +74,18 @@ def embed_tow_with_exif_module(image_path, tow_value, latest_gps):
     img.model = "Blackfly S"
     img.focal_length = "6"
     if latest_gps and latest_gps["lat"] is not None and latest_gps["lon"] is not None:
+
+
         lat_deg, lat_min, lat_sec = decimal_to_dms_precise(abs(latest_gps["lat"]))
         lon_deg, lon_min, lon_sec = decimal_to_dms_precise(abs(latest_gps["lon"]))
+        
         img.gps_latitude = (lat_deg, lat_min, lat_sec)
         img.gps_latitude_ref ='N'
         img.gps_longitude = (lon_deg, lon_min, lon_sec)
         img.gps_longitude_ref = 'W'
-        img.gps_altitude = decimal_to_dms_precise(latest_gps["alt"])
+        img.gps_altitude = latest_gps["alt"]
         img.gps_altitude_ref = 0
+    
 
 
     with open(image_path, 'wb') as new_file:
@@ -138,7 +142,7 @@ def cam_configuration(nodemap,
                       s_node_map,
                       frameRate=1,
                       pgrExposureCompensation=0,
-                      exposureTime="auto",
+                      exposureTime=6000,
                       gain=0,
                       blackLevel=0,
                       bufferCount=30,
@@ -176,21 +180,28 @@ def cam_configuration(nodemap,
     print('\n=================== Config camera ==============================================\n')
     result = True
     ## find AcquisitionMode
-    AcquisitionMode = get_IEnumeration_node_current_entry_name(nodemap, 'AcquisitionMode', verbose=False)
-    if not (AcquisitionMode == 'Continuous'):
-        result &= setAcquisitionMode(nodemap, AcquisitionModeName='Continuous')
-    # TODO:
-    ## find frame rate
-    # if frameRate is not None:
-    result &= setFrameRate(nodemap, frameRate=frameRate)
-    # ExposureCompensationAuto = get_IEnumeration_node_current_entry_name(nodemap, 'pgrExposureCompensationAuto', verbose=False)
-    # if not (ExposureCompensationAuto == 'Off'):
-    #     result &= disableExposureCompensationAuto(nodemap)
-    # if pgrExposureCompensation is not None:
-    #     result &= setExposureCompensation(nodemap, pgrExposureCompensation=pgrExposureCompensation)
-    ## find exposure mode
-    if exposureTime is not None:
+    # 1. Enable manual frame rate control
+    ptrAcquisitionFrameRateEnable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+    if PySpin.IsAvailable(ptrAcquisitionFrameRateEnable) and PySpin.IsWritable(ptrAcquisitionFrameRateEnable):
+        ptrAcquisitionFrameRateEnable.SetValue(True)
+        print('Set AcquisitionFrameRateEnable to True')
+    else:
+        print('Failed to enable AcquisitionFrameRateEnable')
+        return False
+
+    # 2. Set Acquisition Mode to Continuous (required for frame rate control)
+    result &= setAcquisitionMode(nodemap, AcquisitionModeName='Continuous')
+
+    # 3. Set Frame Rate (only works if AcquisitionFrameRateEnable=True)
+    if frameRate is not None:
+        result &= setFrameRate(nodemap, frameRate=frameRate)
+
+    # Rest of your configuration (exposure, gain, etc.)
+    if isinstance(exposureTime, str) and exposureTime.lower() == "auto":
+        result &= enableExposureAuto(nodemap)
+    elif exposureTime is not None:
         result &= setExposureTime(nodemap, exposureTime=exposureTime)
+
     if gain is not None:
         result &= setGain(nodemap, gain=gain)
     if blackLevel is not None:
@@ -209,8 +220,8 @@ def acquire_images(cam,
                    num_images,
                    savedir,
                    triggerType,
-                   frameRate=200,
-                   exposureTime="auto",
+                   frameRate=1,
+                   exposureTime=6000,
                    gain=0,
                    blackLevel=0,
                    bufferCount=30,
@@ -292,7 +303,7 @@ def acquire_images(cam,
                 continue
 
             # Save every frame (or use `if count % 5 == 0` to save every 5th frame)
-            filename = f'mid_frame_{count:06d}.jpg'
+            filename = f'frame_{count:06d}.jpg'
             save_path = os.path.join(savedir, filename)
             cv2.imwrite(save_path, frame)
             #write TOW to exif data
@@ -435,8 +446,8 @@ def run_single_camera(cam,
                       acquisition_index,
                       num_images,
                       triggerType,
-                      frameRate=0.5,
-                      exposureTime=3000,
+                      frameRate=1,
+                      exposureTime=6000,
                       gain=0,
                       bufferCount=30,
                       timeout=10):
@@ -652,25 +663,29 @@ def get_IBoolean_node_current_val(nodemap, nodename, verbose=True):
 
 
 def enableFrameRateSetting(nodemap):
-    # Turn off "AcquisitionFrameRateAuto"    
-    acqFrameRateAuto = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionFrameRateAuto"))
+    # First check if frame rate control is available
+    if not PySpin.IsAvailable(nodemap.GetNode("AcquisitionFrameRateEnable")):
+        print('AcquisitionFrameRateEnable node not available')
+        return False
     
-    if (not PySpin.IsAvailable(nodemap.GetNode("AcquisitionFrameRateEnable"))) or (not PySpin.IsWritable(nodemap.GetNode("AcquisitionFrameRateEnable"))):
-        print('Unable to retrieve AcquisitionFrameRateAuto. Aborting...')
+    # Enable frame rate control
+    ptrAcquisitionFrameRateEnable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+    if not PySpin.IsAvailable(ptrAcquisitionFrameRateEnable) or not PySpin.IsWritable(ptrAcquisitionFrameRateEnable):
+        print('Unable to access AcquisitionFrameRateEnable node')
         return False
-    acqFrameRateAutoOff = acqFrameRateAuto.GetEntryByName('True')
-    if (not PySpin.IsAvailable(acqFrameRateAutoOff)) or (not PySpin.IsReadable(acqFrameRateAutoOff)):
-        print('Unable to set Buffer Handling mode (Value retrieval). Aborting...')
-        return False
-    acqFrameRateAuto.SetIntValue(acqFrameRateAutoOff.GetValue())  # setting to Off
-    print('Set AcquisitionFrameRateAuto to off')
-    # Turn on "AcquisitionFrameRateEnabled"
-    acqFrameRateEnabled = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnabled"))
-    if (not PySpin.IsAvailable(acqFrameRateEnabled)) or (not PySpin.IsWritable(acqFrameRateEnabled)):
-        print('Unable to retrieve AcquisitionFrameRateEnabled. Aborting...')
-        return False
-    acqFrameRateEnabled.SetValue(True)
-    print('Set AcquisitionFrameRateEnabled to True')
+    
+    ptrAcquisitionFrameRateEnable.SetValue(True)
+    print('Set AcquisitionFrameRateEnable to True')
+    
+    # Disable auto frame rate if it exists
+    if PySpin.IsAvailable(nodemap.GetNode("AcquisitionFrameRateAuto")):
+        ptrAcquisitionFrameRateAuto = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionFrameRateAuto"))
+        if PySpin.IsAvailable(ptrAcquisitionFrameRateAuto) and PySpin.IsWritable(ptrAcquisitionFrameRateAuto):
+            entry_off = ptrAcquisitionFrameRateAuto.GetEntryByName("Off")
+            if PySpin.IsAvailable(entry_off) and PySpin.IsReadable(entry_off):
+                ptrAcquisitionFrameRateAuto.SetIntValue(entry_off.GetValue())
+                print('Set AcquisitionFrameRateAuto to Off')
+    
     return True
 
 
@@ -1333,7 +1348,11 @@ def main():
                                         acquisition_index=acquisition_index,
                                         num_images=num_images,
                                         triggerType=triggerType,
-                                        exposureTime="auto")
+                                        frameRate=1,
+                                        exposureTime="auto",
+                                        gain=None,
+                                        bufferCount=15,
+                                        timeout=1000)
             print('Camera %d example complete...' % i)
 
         # Release reference to camera
@@ -1356,55 +1375,8 @@ def main():
     return result
 
 
-# --- Add EXIF GPS writing function ---
-def embed_gps_with_exif(image_path, gps):
-    """
-    Write GPS coordinates to EXIF metadata.
-    gps: dict with 'lat', 'lon', 'alt'
-    """
-    with open(image_path, 'rb') as img_file:
-        img = Image(img_file)
-    if gps and gps["lat"] is not None and gps["lon"] is not None:
-        img.gps_latitude = gps['lat']
-        img.gps_longitude = gps['lon']
-        img.gps_altitude = gps['alt']
-    with open(image_path, 'wb') as new_file:
-        new_file.write(img.get_file())
-    return True
-
 if __name__ == '__main__':
     if main():
         sys.exit(0)
     else:
         sys.exit(1)
-        
-        
-#%%
-
-# acquisition_index = 0
-# num_images = 15
-# triggerType = "software"
-# result, system, cam_list, num_camerasmeras = sysScan()
-
-# if result:
-#     # Run example on each camera
-#     savedir = r"D:\images\test"
-#     clearDir(savedir)
-#     for i, cam in enumerate(cam_list):
-#         print('Running example for camera %d...' % i)
-        
-# cam.Init()
-    
-# nodemap = cam.GetNodeMap()
-# nodemap_tldevice = cam.GetTLDeviceNodeMap()
-# s_node_map = cam.GetTLStreamNodeMap()
-
-
-# frameRate=10
-# exposureTime=8333
-# gain=0
-# blackLevel=0
-# bufferCount=15
-# timeout=10
-# verbose=True
-
