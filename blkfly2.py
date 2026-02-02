@@ -35,8 +35,8 @@ import time
 import numpy as np
 from datetime import datetime, timezone
 from time import perf_counter_ns
-#import piexif
-from PIL import Image
+import piexif
+from PIL import Image as Image1
 from exif import Image
 import threading
 import socket
@@ -44,6 +44,7 @@ import json
 from fractions import Fraction
 import queue
 import signal
+import io
 # --- Camera identifier: set this for each camera script ---
 CAMERA_ID = "right"  # Change to "mid" or "right" for each camera
 
@@ -51,9 +52,10 @@ latest_gps = { "lat": None, "lon": None, "alt": None }
 SAVE_QUEUE_SIZE = 100
 STREAM_QUEUE_SIZE = 1000
 STREAM_EVERY_N = 1  # 200 FPS acquisition -> 20 FPS stream
-
+Exif_Queue_size = 1000
 save_q = queue.Queue(maxsize=SAVE_QUEUE_SIZE)
 stream_q = queue.Queue(maxsize=STREAM_QUEUE_SIZE)
+exif_q = queue.Queue(maxsize = Exif_Queue_size)
 
 # Event to signal threads to stop
 stop_event = threading.Event()
@@ -61,21 +63,64 @@ TARGET_IP = '192.168.1.1'
 TARGET_PORT = 5000
 stop_event = threading.Event()
 
+def verify_piexif_inputs(exif_bytes, image_bytes):
+    """
+    Checks if the data is in the proper format for piexif.insert.
+    Returns: (bool, str) - (Success status, Error message)
+    """
+    # 1. Check if both inputs are bytes
+    if not isinstance(exif_bytes, bytes):
+        return False, f"exif_bytes must be bytes, got {type(exif_bytes)}"
+    if not isinstance(image_bytes, bytes):
+        return False, f"image_bytes must be bytes, got {type(image_bytes)}"
+
+    # 2. Verify EXIF Header
+    # piexif requires the bytes to start with b'Exif\x00\x00'
+    if not exif_bytes.startswith(b'Exif'):
+        return False, "exif_bytes missing 'Exif' header"
+
+    # 3. Verify JPEG SOI (Start of Image) marker
+    # A valid JPEG byte stream must start with \xff\xd8
+    if not image_bytes.startswith(b'\xff\xd8'):
+        return False, "image_bytes is not a valid JPEG (missing SOI marker)"
+
+    return True, "Valid"
+
 def broadcast_thread(stream_q, stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     while not stop_event.is_set() or not stream_q.empty():
         try:
             frame_id, ts, frame = stream_q.get(timeout=0.5)
+            exif_bytes = exif_q.get(timeout = 0.5)
+
         except queue.Empty:
             continue
-
         _, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        data = encoded.tobytes()
+        img_data = encoded.tobytes()
+        final_packet = img_data
+        #print('type', type(img_data))
+        #print('len', len(img_data))
+        #print('head', img_data[:100])
+        if exif_bytes is not None:
+            is_valid, msg = verify_piexif_inputs(exif_bytes, img_data)
+            if is_valid:
+                try:
+                    output = io.BytesIO()
+                    #exif_dict = piexif.load(exif_bytes)
+                    #exif_dump = piexif.dump(exif_dict)
+                    final_packet = piexif.insert(exif_bytes, img_data, output)
+                    final_packet = output.getvalue()
+                    print(final_packet)
+                    print('added EXIF successfully\n')
+                except Exception as e:
+                    print(f'Failed to insert EXIF: {e}')
+            else:
+                print(f'skipping Exif insertion for Frame {frame_id} due to invalid exif format')
 
-        if len(data) < 65000:  # UDP max packet size
+        if len(final_packet) < 70000:  # UDP max packet size
             print('sending data to', TARGET_IP, TARGET_PORT)
-            sock.sendto(data, (TARGET_IP, TARGET_PORT))
+            sock.sendto(final_packet, (TARGET_IP, TARGET_PORT))
         else:
             print(f"Frame {frame_id} too large to send via UDP")
 
@@ -352,8 +397,9 @@ def acquire_images(cam,
                                     s_node_map=s_node_map,
                                     triggerType="off",
                                     verbose=verbose)  # 'off' for preview
-
-    cam.BeginAcquisition()
+    
+    if not cam.IsStreaming():
+        cam.BeginAcquisition()
     count = 0
     try:
         while True:
@@ -365,13 +411,17 @@ def acquire_images(cam,
             # Save every frame (or use `if count % 5 == 0` to save every 5th frame)
             filename = f'frame_{count:06d}.jpg'
             save_path = os.path.join(savedir, filename)
-            #cv2.imwrite(save_path, frame)
+            cv2.imwrite(save_path, frame)
             #write TOW to exif data
-            #tow = get_tow_from_utc()
-            #embed_tow_with_exif_module(save_path, tow, latest_gps)
+            tow = get_tow_from_utc()
+            #print(tow)
+            embed_tow_with_exif_module(save_path, tow, latest_gps)
             #embed_gps_with_exif(save_path, latest_gps)
+            img = Image1.open(save_path)
+            exif_bytes = img.info.get("exif")
             try:
                 stream_q.put_nowait(packet)
+                exif_q.put_nowait(exif_bytes)
             except queue.Full:
                 print('Queue full')
                 pass
@@ -1426,7 +1476,8 @@ def print_trigger_config(nodemap, s_node_map, triggerType="software"):
 
 
 def main():
-    global system
+    global system, x
+    x = 1
     # Start GPS listener thread
     print("[main] Launching gps_listener thread...")
     print("[main] Threads before GPS start:", [t.name for t in threading.enumerate()])
@@ -1462,6 +1513,7 @@ def main():
                                         bufferCount=15,
                                         timeout=1000)
             print('Camera %d example complete...' % i)
+            x = 2
         '''acquisition_thread = threading.Thread(
             target=acquire_images,
             args=(
@@ -1472,14 +1524,16 @@ def main():
             triggerType,
             save_q,
             stream_q,
-            stop_event
+            stop_event,
+            cam_list,
+            system
         ),
         daemon=True
-    )
-        acquisition_thread.start()
-        stream_thread = threading.Thread(target=broadcast_thread, args=(stream_q, stop_event), daemon = True)
-        acquisition_thread.start()
-        stream_thread.start()'''
+    )'''
+        #acquisition_thread.start()
+        #stream_thread = threading.Thread(target=broadcast_thread, args=(stream_q, stop_event), daemon = True)
+        #acquisition_thread.start()
+        #stream_thread.start()
         # Release reference to camera
         # NOTE: Unlike the C++ examples, we cannot rely on pointer objects being automatically
         # cleaned up when going out of scope.
@@ -1518,7 +1572,7 @@ def main():
 
     # Stop camera
         #cam.EndAcquisition()
-        #cam.DeInit()
+        cam.DeInit()
 
     # Delete camera object
         del cam
@@ -1568,6 +1622,5 @@ if __name__ == '__main__':
 # bufferCount=15
 # timeout=10
 # verbose=True
-
 
 
