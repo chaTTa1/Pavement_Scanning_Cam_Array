@@ -14,6 +14,8 @@ import threading
 import queue
 import os
 import time
+from PIL import Image
+import io
 # =====================
 # Configuration
 # =====================
@@ -63,11 +65,11 @@ def init():
 
 
 def reciever():
-    global latest_left, latest_mid, latest_right
+    global latest_left, latest_mid, latest_right, data
     while not stop_event.is_set():
         try:
             data, addr = sock.recvfrom(65536)
-            print('revieved from ', addr)
+            print(data)
         except socket.timeout:
             print('no data recieved')
             continue
@@ -75,19 +77,24 @@ def reciever():
             print('OSerror')
             break
         sender_ip, _ = addr
-        npdata = np.frombuffer(data, dtype=np.uint8)
-        frame = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
+
         if sender_ip == "192.168.1.12":
-            ls_q.put(frame, timeout = 5)
+            ls_q.put(data, timeout = 5)
             with frame_lock:
+                npdata = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
                 latest_left = frame
         elif sender_ip == "192.168.1.11":
-            ms_q.put(frame, timeout = 5)
+            ms_q.put(data, timeout = 5)
             with frame_lock:
+                npdata = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
                 latest_mid = frame
         elif sender_ip == "192.168.1.13":
-            rs_q.put(frame, timeout = 5)
+            rs_q.put(data, timeout = 5)
             with frame_lock:
+                npdata = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
                 latest_right = frame
         else:
             print("unknown ip address")
@@ -168,9 +175,12 @@ def saver():
             l_file_path = os.path.join(left_file_path, f"{l_name}_{i}{ext}")
             m_file_path = os.path.join(mid_file_path, f"{m_name}_{i}{ext}")
             r_file_path = os.path.join(right_file_path, f"{r_name}_{i}{ext}")
-            cv2.imwrite(l_file_path, l_img)
-            cv2.imwrite(m_file_path, m_img)
-            cv2.imwrite(r_file_path, r_img)
+            with open(l_file_path, 'wb') as f:
+                f.write(l_img)
+            with open(m_file_path, 'wb') as f:
+                f.write(m_img)
+            with open(r_file_path, 'wb') as f:
+                f.write(r_img)
             i = i+1
         time.sleep(.5)
     print('saver exiting cleanly')
@@ -341,6 +351,7 @@ def main():
                 mid_img = latest_mid
                 right_img = latest_right
             if left_img is None or mid_img is None or right_img is None:
+                #
                 print('no images to display')
                 continue
                 
