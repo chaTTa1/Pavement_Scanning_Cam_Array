@@ -69,7 +69,8 @@ def reciever():
     while not stop_event.is_set():
         try:
             data, addr = sock.recvfrom(65536)
-            print(data)
+            sender_ip, _ = addr
+            print('recieved from', sender_ip)
         except socket.timeout:
             print('no data recieved')
             continue
@@ -350,9 +351,17 @@ def main():
                 left_img = latest_left
                 mid_img = latest_mid
                 right_img = latest_right
-            if left_img is None or mid_img is None or right_img is None:
-                #
-                print('no images to display')
+            if left_img is None and mid_img is None and right_img is None:
+                print('all cameras failing to send')
+                continue
+            elif left_img is None:
+                print('left camera failing to send')
+                continue
+            elif mid_img is None:
+                print('mid camera failing to send')
+                continue
+            elif right_img is None:
+                print('right camera failing to send')
                 continue
                 
                    
