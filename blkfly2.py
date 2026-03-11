@@ -29,6 +29,7 @@ from tkinter import Image
 import PySpin
 import sys
 import time
+import struct
 #import piexif
 #import usb.core
 #import lcpy
@@ -45,17 +46,20 @@ from fractions import Fraction
 import queue
 import signal
 import io
+import Jetson.GPIO as GPIO
 # --- Camera identifier: set this for each camera script ---
-CAMERA_ID = "right"  # Change to "mid" or "right" for each camera
+CAMERA_ID = "left"  # Change to "mid" or "right" for each camera
 
 latest_gps = { "lat": None, "lon": None, "alt": None }
-SAVE_QUEUE_SIZE = 100
+SAVE_QUEUE_SIZE = 10000
+TIME_QUEUE_SIZE = 10000
 STREAM_QUEUE_SIZE = 1000
 STREAM_EVERY_N = 1  # 200 FPS acquisition -> 20 FPS stream
 Exif_Queue_size = 1000
 save_q = queue.Queue(maxsize=SAVE_QUEUE_SIZE)
 stream_q = queue.Queue(maxsize=STREAM_QUEUE_SIZE)
 exif_q = queue.Queue(maxsize = Exif_Queue_size)
+time_q = queue.Queue(maxsize = TIME_QUEUE_SIZE)
 
 # Event to signal threads to stop
 stop_event = threading.Event()
@@ -91,32 +95,32 @@ def broadcast_thread(stream_q, stop_event):
 
     while not stop_event.is_set() or not stream_q.empty():
         try:
-            frame_id, ts, frame = stream_q.get(timeout=0.5)
-            exif_bytes = exif_q.get(timeout = 0.5)
+            jpeg_bytes = stream_q.get(timeout=0.5)
+            exif_byte = exif_q.get(timeout = 0.5)
 
         except queue.Empty:
             continue
-        _, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        img_data = encoded.tobytes()
-        final_packet = img_data
+#         _, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+#         img_data = encoded.tobytes()
+#         final_packet = img_data
         #print('type', type(img_data))
         #print('len', len(img_data))
         #print('head', img_data[:100])
-        if exif_bytes is not None:
-            is_valid, msg = verify_piexif_inputs(exif_bytes, img_data)
+        if exif_byte is not None:
+            is_valid, msg = verify_piexif_inputs(exif_byte, jpeg_bytes)
             if is_valid:
                 try:
                     output = io.BytesIO()
                     #exif_dict = piexif.load(exif_bytes)
                     #exif_dump = piexif.dump(exif_dict)
-                    final_packet = piexif.insert(exif_bytes, img_data, output)
+                    piexif.insert(exif_byte, jpeg_bytes, output)
                     final_packet = output.getvalue()
                     print(final_packet)
                     print('added EXIF successfully\n')
                 except Exception as e:
                     print(f'Failed to insert EXIF: {e}')
             else:
-                print(f'skipping Exif insertion for Frame {frame_id} due to invalid exif format')
+                print(f'skipping Exif insertion for Frame due to invalid exif format')
 
         if len(final_packet) < 70000:  # UDP max packet size
             print('sending data to', TARGET_IP, TARGET_PORT)
@@ -158,12 +162,61 @@ def get_tow_from_utc():
     tow = gps_seconds % (7 * 86400) # Time of Week (TOW) in seconds
     return round(tow, 4)
 
+
+
+def exif_bytes(make, model, comment, focal):
+    """
+    Build EXIF bytes compatible with piexif.insert().
+    GPS data removed.
+
+    Parameters
+    ----------
+    make : str
+        Camera manufacturer
+    model : str
+        Camera model
+    comment : str
+        User comment (e.g. timestamp or TOW)
+    focal : float or int
+        Focal length in mm
+
+    Returns
+    -------
+    bytes
+        EXIF byte block usable with piexif.insert()
+    """
+
+    from fractions import Fraction
+
+    def to_rational(value):
+        f = Fraction(value).limit_denominator()
+        return (f.numerator, f.denominator)
+
+    exif_dict = {
+        "0th": {
+            piexif.ImageIFD.Make: make,
+            piexif.ImageIFD.Model: model,
+        },
+
+        "Exif": {
+            piexif.ExifIFD.UserComment: b"ASCII\x00\x00\x00" + comment.encode(),
+            piexif.ExifIFD.FocalLength: to_rational(float(focal)),
+        },
+
+        "GPS": {},
+
+        "1st": {},
+        "thumbnail": None
+    }
+
+    return piexif.dump(exif_dict)
+
 def embed_tow_with_exif_module(image_path, tow_value, latest_gps):
     with open(image_path, 'rb') as img_file:
         img = Image(img_file)
 
 
-    img.user_comment = f"TOW={tow_value:.4f}"
+    img.user_comment = f"T_from_pulse={tow_value:.4f}"
     img.make = "Flir"
     img.model = "Blackfly S"
     img.focal_length = "6"
@@ -239,7 +292,7 @@ def cam_configuration(nodemap,
                       s_node_map,
                       frameRate=200,
                       pgrExposureCompensation=0,
-                      exposureTime=6000,
+                      exposureTime=3000,
                       gain=0,
                       blackLevel=0,
                       bufferCount=30,
@@ -314,6 +367,48 @@ def cam_configuration(nodemap,
     return result
 
 
+def image_proc_thread(save_q, time_q,savedir, stop_event):
+    count = 0
+    while not stop_event.is_set() or not save_q.empty() or not time_q.empty():
+        try:
+            packet = save_q.get(timeout = 0.5)
+            frame_id, ts, frame = packet
+            time = time_q.get(timeout = 0.5)
+            time = str(time)
+        except queue.Empty:
+            continue
+        _, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        img_data = encoded.tobytes()
+        final_packet = img_data
+        if latest_gps and latest_gps["lat"] is not None and latest_gps["lon"] is not None:
+
+
+            lat_deg, lat_min, lat_sec = decimal_to_dms_precise(abs(latest_gps["lat"]))
+            lon_deg, lon_min, lon_sec = decimal_to_dms_precise(abs(latest_gps["lon"]))
+        
+            gps_latitude = (lat_deg, lat_min, lat_sec)
+            gps_latitude_ref ='N'
+            gps_longitude = (lon_deg, lon_min, lon_sec)
+            gps_longitude_ref = 'W'
+            gps_altitude = latest_gps["alt"]
+            gps_altitude_ref = 0
+        #write TOW to exif data
+
+            #print(tow)
+        exif_byte = exif_bytes('Flir', 'BlackFly', str(time), 6)
+            #exif_bytes = exif_bytes("Flir", "Blackfly S3", offset, latest_gps)#embed_tow_with_exif_module(save_path, offset, latest_gps)
+            #embed_gps_with_exif(save_path, latest_gps)
+        #img = Image1.open(save_path)
+        #exif_bytes = img.info.get("exif")
+        try:
+            stream_q.put_nowait(final_packet)
+            exif_q.put_nowait(exif_byte)
+        except queue.Full:
+            print('Queue full')
+            pass
+        count += 1
+
+
 def acquire_images(cam,
                    acquisition_index,
                    num_images,
@@ -325,10 +420,10 @@ def acquire_images(cam,
                    cam_list,
                    system,
                    frameRate=200,
-                   exposureTime=6000,
+                   exposureTime=300,
                    gain=0,
                    blackLevel=0,
-                   bufferCount=30,
+                   bufferCount=300,
                    timeout=10,
                    verbose=True):
     print ('acquiring images')
@@ -404,27 +499,30 @@ def acquire_images(cam,
     try:
         while True:
             ret, frame, packet = capture_image(cam, count)
+            tow = get_tow_from_utc()
+            offset = tow - event_time
             if not ret or frame is None or packet is None:
                 print("Capture failed")
                 continue
-
+            save_q.put_nowait(packet)
+            time_q.put_nowait(offset)
             # Save every frame (or use `if count % 5 == 0` to save every 5th frame)
-            filename = f'frame_{count:06d}.jpg'
-            save_path = os.path.join(savedir, filename)
-            cv2.imwrite(save_path, frame)
+            #filename = f'frame_{count:06d}.jpg'
+            #save_path = os.path.join(savedir, filename)
+            #cv2.imwrite(save_path, frame)
             #write TOW to exif data
-            tow = get_tow_from_utc()
+
             #print(tow)
-            embed_tow_with_exif_module(save_path, tow, latest_gps)
+            #exif_bytes = exif_bytes("Flir", "Blackfly S3", offset, latest_gps)#embed_tow_with_exif_module(save_path, offset, latest_gps)
             #embed_gps_with_exif(save_path, latest_gps)
-            img = Image1.open(save_path)
-            exif_bytes = img.info.get("exif")
-            try:
-                stream_q.put_nowait(packet)
-                exif_q.put_nowait(exif_bytes)
-            except queue.Full:
-                print('Queue full')
-                pass
+            #img = Image1.open(save_path)
+            #exif_bytes = img.info.get("exif")
+            #try:
+                #stream_q.put_nowait(packet)
+                #exif_q.put_nowait(exif_bytes)
+            #except queue.Full:
+                #print('Queue full')
+                #pass
             
 
             count += 1
@@ -1476,14 +1574,47 @@ def print_trigger_config(nodemap, s_node_map, triggerType="software"):
 
 
 def main():
-    global system, x
+    global system, x, event_time
+    savedir = r"/home/agx1/road_inspection_project/road_test_2"
+    PPS_PIN = 16
     x = 1
+    pps = 0
+        # 1. Setup
+    GPIO.setmode(GPIO.BOARD) 
+    GPIO.setup(PPS_PIN, GPIO.IN)
+
+    print(f"--- LISTENING ON PIN {PPS_PIN} ---")
+    print("Setup:")
+    print(f"1. ESP32 GPIO 18 -> Buffer Input")
+    print(f"2. Buffer Output  -> Jetson Pin {PPS_PIN}")
+    print("3. VCC = 3.3V (Do not use 5V!)")
+    print("----------------------------------\n")
+
+    try:
+        while pps < 1:
+            # Wait for Rising Edge (Low -> High)
+            GPIO.wait_for_edge(PPS_PIN, GPIO.RISING)
+            
+            # Timestamp
+            event_time = get_tow_from_utc()
+            print(f"[{event_time}] 🟢 PPS Trigger Received!")
+            
+            # Debounce sleep (prevents double counting)
+            time.sleep(0.1)
+            pps = 1
+
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    finally:
+        GPIO.cleanup()
     # Start GPS listener thread
     print("[main] Launching gps_listener thread...")
     print("[main] Threads before GPS start:", [t.name for t in threading.enumerate()])
-    gps_thread = threading.Thread(target=gps_listener, name="GPS-Listener", daemon=True)
+    #gps_thread = threading.Thread(target=gps_listener, name="GPS-Listener", daemon=True)
     stream_thread = threading.Thread(target=broadcast_thread, args=(stream_q, stop_event), daemon = True)
-    gps_thread.start()
+    process_thread = threading.Thread(target=image_proc_thread, args=(save_q,time_q,savedir,stop_event), daemon =True)
+    process_thread.start()
+    #gps_thread.start()
     stream_thread.start()
     time.sleep(5)
     print("[main] Threads after GPS start: ", [t.name for t in threading.enumerate()])
@@ -1495,7 +1626,6 @@ def main():
 
     if result:
         # Run example on each camera
-        savedir = r"/home/ryan6/Alex/Blackfly/road_test_2"
         os.makedirs(savedir, exist_ok=True)
         clearDir(savedir)
         for i, cam in enumerate(cam_list):
@@ -1566,6 +1696,8 @@ def main():
         print('joined gps thread')
         #stream_thread.join()           # wait for streaming thread
         print('joined stream thread')
+        #process_thread.join()
+        print('joined process thread')
     # --- Safe shutdown ---
     # Clear queues so no references remain
 
