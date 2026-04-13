@@ -30,6 +30,8 @@ from fractions import Fraction
 import queue
 import signal
 import io
+import math
+import time
 import Jetson.GPIO as GPIO
 
 # --- Camera identifier: set this for each camera script ---
@@ -397,6 +399,45 @@ def image_proc_thread(save_q, time_q, savedir, stop_event):
         finally:
             save_q.task_done()
 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculates the distance in meters between two GPS coordinates."""
+    if None in (lat1, lon1, lat2, lon2):
+        return 0.0
+        
+    R = 6371000  # Radius of Earth in meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def calculate_dynamic_delay(prev_gps, curr_gps, prev_time, curr_time, target_meters_per_frame=2.0, max_fps=150, min_fps=1):
+    """Calculates required sleep time to maintain a constant spatial resolution."""
+    if not prev_gps.get('lat') or not curr_gps.get('lat'):
+        return 1.0 / min_fps
+
+    dt = curr_time - prev_time
+    if dt <= 0:
+        return 1.0 / min_fps
+
+    distance_m = haversine_distance(
+        prev_gps['lat'], prev_gps['lon'], 
+        curr_gps['lat'], curr_gps['lon']
+    )
+    
+    speed_m_s = distance_m / dt
+
+    if speed_m_s < 0.2:  # If stationary or moving extremely slowly
+        target_fps = min_fps
+    else:
+        target_fps = speed_m_s / target_meters_per_frame
+
+    # Clamp FPS to safe camera capabilities
+    target_fps = max(min_fps, min(target_fps, max_fps))
+    
+    return 1.0 / target_fps
+
 
 def acquire_images(cam,
                    acquisition_index,
@@ -415,6 +456,39 @@ def acquire_images(cam,
                    bufferCount=300,
                    timeout=10,
                    verbose=True):
+    
+    
+    """
+    Configures the camera and executes the image acquisition loop based on the specified trigger mode.
+
+    This function applies hardware configurations (exposure, gain, framerate, etc.) to the 
+    Spinnaker camera, initializes the appropriate trigger settings ("off"/continuous, "software", 
+    or "hardware"), and begins capturing frames. Captured frames and their timestamps are 
+    pushed to a queue for asynchronous processing and saving.
+
+    Args:
+        cam (PySpin.CameraPtr): The Spinnaker camera object to be configured and read.
+        acquisition_index (int): Identifier for the current acquisition session.
+        num_images (int): The target number of images to capture (used in software/hardware modes).
+        savedir (str): Directory path where images should be saved.
+        triggerType (str): The type of trigger to use ("off" for continuous, "software", or "hardware").
+        save_q (queue.Queue): The queue where captured frames and timestamps are pushed for processing.
+        stream_q (queue.Queue): The queue used for broadcasting/streaming images.
+        stop_event (threading.Event): Event flag used to gracefully terminate loops from the main thread.
+        cam_list (PySpin.CameraList): The Spinnaker camera list object.
+        system (PySpin.SystemPtr): The Spinnaker system instance.
+        frameRate (float, optional): Target frame rate in Hz. Defaults to 200.
+        exposureTime (int/str, optional): Exposure time in microseconds, or "auto". Defaults to 300.
+        gain (float, optional): Sensor gain value. Defaults to 0.
+        blackLevel (float, optional): Sensor black level. Defaults to 0.
+        bufferCount (int, optional): Number of memory buffers allocated for the stream. Defaults to 300.
+        timeout (int, optional): Max time in seconds to wait for a hardware-triggered frame before aborting. Defaults to 10.
+        verbose (bool, optional): If True, prints device info and configuration status to the console. Defaults to True.
+
+    Returns:
+        bool: True if the acquisition cycle completed successfully, False if an error or timeout occurred.
+    """
+    
     print('acquiring images')
     """
     Acquire and save images from a device.
@@ -484,6 +558,88 @@ def acquire_images(cam,
                                     triggerType=triggerType,
                                     verbose=verbose)
     activate_trigger(nodemap)
+    
+    if triggerType == "gpio":
+            print("======== Trigger: GPIO Sync + GPS Speed Delay (Infinite Run) ========")
+            count = 0
+            
+            # Trackers for the GPS math
+            prev_gps = {"lat": None, "lon": None, "alt": None}
+            prev_time = time.time()
+            TARGET_METERS_PER_FRAME = 2.0
+            
+            PPS_PIN = 7 
+            
+            try:
+                while not stop_event.is_set():
+                    
+                    # 1. Wait for the hardware pulse (Blocks until the pin goes HIGH)
+                    edge = GPIO.wait_for_edge(PPS_PIN, GPIO.RISING, timeout=2000)
+                    
+                    if edge is None:
+                        continue # Skip printing to avoid spam, just wait again
+    
+                    # 2. Pulse received! Verify GPS and calculate delay
+                    curr_time = time.time()
+                    
+                    if latest_gps.get('lat') is None:
+                        print("[WARNING] No GPS lock! Defaulting to 1.0s delay.")
+                        sleep_delay = 1.0  # Safe fallback delay
+                    else:
+                        # GPS is valid, calculate real speed
+                        sleep_delay = calculate_dynamic_delay(
+                            prev_gps=prev_gps, 
+                            curr_gps=latest_gps, 
+                            prev_time=prev_time, 
+                            curr_time=curr_time, 
+                            target_meters_per_frame=TARGET_METERS_PER_FRAME
+                        )
+                        # Update previous GPS state only if we had a valid reading
+                        prev_gps = latest_gps.copy()
+                    
+                    # Update previous time regardless of GPS lock
+                    prev_time = curr_time
+                    
+                    print(f"[GPIO Pulse Received] Using delay: {sleep_delay:.3f}s")
+    
+                    # 3. Capture from the free-running stream based on the delay
+                    time_since_pulse = 0.0
+                    
+                    while time_since_pulse < 1.0 and not stop_event.is_set():
+                        start_capture = time.time()
+                        
+                        # Sleep first to ensure the exact GPS-calculated spatial gap
+                        time.sleep(sleep_delay)
+                        
+                        # Capture the newest image directly from the buffer
+                        ret, frame, packet = capture_image(cam, count)
+                        
+                        if not ret or frame is None or packet is None:
+                            continue # Silently skip failed grabs rather than breaking
+                            
+                        tow = get_tow_from_utc()
+                        offset = tow - event_time
+                            
+                        drop_oldest_and_put(save_q, (packet, offset), "save")
+                        print(f"Captured Frame {count}")
+                        
+                        count += 1
+                        time_since_pulse += (time.time() - start_capture)
+    
+            # Error handling cleanly breaks the loop
+            except queue.Full:
+                print("Processing queues are full; dropping frame and stopping capture.")
+                result = False
+            except PySpin.SpinnakerException as ex:
+                print(f"Spinnaker error during acquisition: {ex}")
+                result = False
+            except Exception as ex:
+                print(f"Unexpected acquisition error: {ex}")
+                result = False
+            except KeyboardInterrupt:
+                print("\n[acquire] User interrupted. Exiting GPIO loop...")
+                pass
+            
 
     if triggerType == "software":
         print("=================Trigger is setting to software================")
@@ -1123,8 +1279,8 @@ def main():
     print(latest_gps)
 
     acquisition_index = 0
-    num_images = 15
-    triggerType = "Off"
+    num_images = 15            # used only if trigger set to "software" and "hardware"
+    triggerType = "Off"       ## "off", "gpio", "software", "hardware"
     result, system, cam_list, num_camerasmeras = sysScan()
 
     if result:
