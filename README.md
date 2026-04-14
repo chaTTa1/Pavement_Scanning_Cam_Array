@@ -319,3 +319,46 @@ If you want to understand the repository quickly, read files in this order:
 5. `cam_array_post_processing.py`
 
 That sequence explains the live runtime first, then the hardware timing source, then the GPS/post-processing side of the project.
+
+
+## Calculate camera capture FPS based on driving speed
+
+Though camera can adjust FPS using FLIR PySpin, but the setting effect after several frame/millisecond later. To avoid this, set camera capture time use a time.sleep() function and let camera decided how long the exposre time should be.
+
+How to calculate the FPS:
+### 1. Variables and Constants
+First, let's define the symbols used in the equations based on your code's inputs:
+* $\phi_1, \lambda_1$: Previous latitude and longitude (converted to radians)
+* $\phi_2, \lambda_2$: Current latitude and longitude (converted to radians)
+* $\Delta\phi, \Delta\lambda$: Difference in latitude and longitude ($\phi_2 - \phi_1$ and $\lambda_2 - \lambda_1$)
+* $R$: Radius of the Earth ($6371000$ meters)
+* $\Delta t$: Time elapsed between the two GPS readings ($t_{current} - t_{previous}$)
+* $D_{target}$: Target distance per frame ($2.0$ meters)
+* $FPS_{min}, FPS_{max}$: The minimum and maximum allowed framerates ($1$ and $150$)
+
+### 2. The Haversine Distance ($d$)
+The great-circle distance between the two GPS coordinates is calculated using the Haversine formula.
+
+First, we calculate the intermediate term $a$:
+$$a = \sin^2\left(\frac{\Delta\phi}{2}\right) + \cos(\phi_1)\cos(\phi_2)\sin^2\left(\frac{\Delta\lambda}{2}\right)$$
+
+Then, we calculate the total distance $d$ in meters:
+$$d = 2R \cdot \text{atan2}\left(\sqrt{a}, \sqrt{1-a}\right)$$
+
+### 3. Velocity ($v$)
+The real-time speed in meters per second is simply the distance divided by the change in time:
+$$v = \frac{d}{\Delta t}$$
+
+### 4. Target Framerate ($f$)
+The required framerate is determined by a piecewise function to handle stationary (or near-stationary) scenarios, followed by a clamping function to keep it within the camera's hardware limits.
+
+**Raw Framerate Calculation:**
+$$f_{raw} = \begin{cases} FPS_{min}, & \text{if } v < 0.2 \\ \frac{v}{D_{target}}, & \text{otherwise} \end{cases}$$
+
+**Hardware Clamping:**
+To ensure the camera doesn't crash or stall, the raw framerate is clamped between your defined minimum and maximum limits:
+$$f = \max\left(FPS_{min}, \min(f_{raw}, FPS_{max})\right)$$
+
+### 5. Final Dynamic Delay ($t_{delay}$)
+Finally, the framerate is inverted to determine the required `time.sleep()` duration (in seconds) between each frame capture:
+$$t_{delay} = \frac{1}{f}$$
