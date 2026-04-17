@@ -292,9 +292,39 @@ def read_gps_line(ser):
     except pynmea2.ParseError as e:
         print(f"Parse error: {e}")
 
+
+class FastLogger:
+    def __init__(self, filename='position_log.csv', batch_size=400):
+        self.filename = filename
+        self.batch_size = batch_size
+        self.buffer = []
+        
+    def log(self, timestamp, gps_pos, gps_error=None):
+        data = {
+            'timestamp': timestamp, 
+            'lat': gps_pos[0], 
+            'lon': gps_pos[1], 
+            'alt': gps_pos[2],
+            'lat_err': gps_error[0] if gps_error else None,
+            'lon_err': gps_error[1] if gps_error else None,
+            'alt_err': gps_error[2] if gps_error else None
+        }
+        self.buffer.append(data)
+        
+        # Write to disk only when buffer is full (e.g., once a second)
+        if len(self.buffer) >= self.batch_size:
+            self.flush()
+            
+    def flush(self):
+        if not self.buffer: return
+        df = pd.DataFrame(self.buffer)
+        df.to_csv(self.filename, mode='a', header=not os.path.exists(self.filename), index=False)
+        self.buffer = []
+
 def main():
     # Initialize sensor fusion
     ekf_fusion = SensorFusionEKF()
+    data_logger = FastLogger(batch_size=400)
     
     # Open serial ports
     try:
@@ -350,16 +380,27 @@ def main():
                     ekf_fusion.update_gps(gps_fix['lat'], gps_fix['lon'], gps_fix['alt'])
                     
                 # Output current position
+                # gps_pos = ekf_fusion.get_gps_position()
+                # if gps_pos is not None:
+                #     print(f"EKF GPS: lat={gps_pos[0]:.8f}, lon={gps_pos[1]:.8f}, alt={gps_pos[2]:.2f}")
+                #     log_position_and_error(pd.Timestamp.now(), gps_pos, gps_error=(
+                #         gps_fix.get('lat_err'),
+                #         gps_fix.get('lon_err'),
+                #         gps_fix.get('alt_err')
+                #     ) if gps_fix else None)
+                    
+                # # Sleep to maintain loop rate
+                # time.sleep(0.001)
+                
                 gps_pos = ekf_fusion.get_gps_position()
                 if gps_pos is not None:
-                    print(f"EKF GPS: lat={gps_pos[0]:.8f}, lon={gps_pos[1]:.8f}, alt={gps_pos[2]:.2f}")
-                    log_position_and_error(pd.Timestamp.now(), gps_pos, gps_error=(
-                        gps_fix.get('lat_err'),
-                        gps_fix.get('lon_err'),
-                        gps_fix.get('alt_err')
-                    ) if gps_fix else None)
+                    # Optional: Only print every 20th time to save console lag
+                    # print(f"EKF GPS: lat={gps_pos[0]:.8f}, lon={gps_pos[1]:.8f}, alt={gps_pos[2]:.2f}")
                     
-                # Sleep to maintain loop rate
+                    # Log to RAM instantly!
+                    err_tuple = (gps_fix.get('lat_err'), gps_fix.get('lon_err'), gps_fix.get('alt_err')) if gps_fix else None
+                    data_logger.log(pd.Timestamp.now(), gps_pos, gps_error=err_tuple)
+                    
                 time.sleep(0.001)
                 
             except Exception as e:
@@ -369,6 +410,7 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
+        data_logger.flush()
         imu_ser.close()
         gps_ser.close()
         print("Serial ports closed")
