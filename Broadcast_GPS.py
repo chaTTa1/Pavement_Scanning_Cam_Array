@@ -160,6 +160,39 @@ class SensorFusionEKF:
             print(f"Position conversion error: {e}")
             return None
 
+# Instead of opening the file 400 times a second, you should save the data to a fast Python List in RAM, 
+# and only write to the hard drive in "chunks" (e.g., once every second).
+class FastLogger:
+    def __init__(self, filename='position_log.csv', batch_size=400):
+        self.filename = filename
+        self.batch_size = batch_size
+        self.buffer = []
+        
+    def log(self, timestamp, gps_pos, gps_error=None):
+        data = {
+            'timestamp': timestamp, 
+            'lat': gps_pos[0], 
+            'lon': gps_pos[1], 
+            'alt': gps_pos[2],
+            'lat_err': gps_error[0] if gps_error else None,
+            'lon_err': gps_error[1] if gps_error else None,
+            'alt_err': gps_error[2] if gps_error else None
+        }
+        self.buffer.append(data)
+        
+        # When the buffer hits 400 lines (about 1 second of data), write it all at once
+        if len(self.buffer) >= self.batch_size:
+            self.flush()
+            
+    def flush(self):
+        if not self.buffer: return
+        df = pd.DataFrame(self.buffer)
+        # Write the whole chunk at once
+        df.to_csv(self.filename, mode='a', header=not os.path.exists(self.filename), index=False)
+        self.buffer = [] # Clear RAM
+
+
+
 # --- Serial & Parsing ---
 IMU_PORT, GPS_PORT = 'COM3', 'COM10'
 IMU_BAUD, GPS_BAUD = 115200, 115200
@@ -214,6 +247,7 @@ def broadcast_all_camera_positions(fused_pos, heading_deg):
 # --- Main Execution ---
 def main():
     ekf_fusion = SensorFusionEKF()
+    data_logger = FastLogger(batch_size=400)
     try:
         imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0.01)
         gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.01)
@@ -248,15 +282,27 @@ def main():
                     last_gps_error = (gps_data['lat_err'], gps_data['lon_err'], gps_data['alt_err'])
 
             # Get fused position and broadcast
+            # fused_pos = ekf_fusion.get_gps_position()
+            # if fused_pos:
+            #     # Use EKF bearing for heading
+            #     x, y, _ = ekf_fusion.ekf.x[0:3]
+            #     heading_deg = np.degrees(np.arctan2(x, y)) % 360
+            #     print(f"EKF GPS: lat={fused_pos[0]:.8f}, lon={fused_pos[1]:.8f}, alt={fused_pos[2]:.2f}")
+            #     broadcast_all_camera_positions(fused_pos, heading_deg)
+            #     log_position_and_error(pd.Timestamp.now(), fused_pos, gps_error=last_gps_error)
+            #     last_gps_error = None # Reset error after logging
+            # Get fused position and broadcast
             fused_pos = ekf_fusion.get_gps_position()
             if fused_pos:
                 # Use EKF bearing for heading
                 x, y, _ = ekf_fusion.ekf.x[0:3]
                 heading_deg = np.degrees(np.arctan2(x, y)) % 360
-                print(f"EKF GPS: lat={fused_pos[0]:.8f}, lon={fused_pos[1]:.8f}, alt={fused_pos[2]:.2f}")
+                
+                # Broadcast first (because network speed is critical)
                 broadcast_all_camera_positions(fused_pos, heading_deg)
-                log_position_and_error(pd.Timestamp.now(), fused_pos, gps_error=last_gps_error)
-                last_gps_error = None # Reset error after logging
+                
+                # Log to RAM second
+                data_logger.log(time.time(), fused_pos, gps_error=last_gps_error)
 
             time.sleep(0.001)
 
@@ -265,6 +311,7 @@ def main():
     except Exception as e:
         print(f"[ERROR] An unexpected error occurred in the main loop: {e}")
     finally:
+        data_logger.flush() # <--- Add this line to save the last few seconds of data
         stop_all_jetson_scripts()
         imu_ser.close()
         gps_ser.close()
