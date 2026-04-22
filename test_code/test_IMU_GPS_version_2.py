@@ -1124,7 +1124,7 @@ def main():
 
     if GPS_ENABLED:
         try:
-            gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.1)
+            gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.01)
             print(f"Opened GPS: {GPS_PORT} @ {GPS_BAUD}")
             if not validate_gps_connection(gps_ser):
                 print("[WARNING] GPS not responding. Disabling.")
