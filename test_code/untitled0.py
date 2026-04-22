@@ -66,7 +66,7 @@ else:
 
 import pandas as pd
 
-df = pd.read_csv(r"C:\Users\rqy19\Documents\github\paper\test_data\sensor_log.csv")
+df = pd.read_csv(r"D:\Ryan\GitHub\paper\Pavement_Scanning_Cam_Array\Pavement_Scanning_Cam_Array\test_code\sensor_log.csv")
 gps = df[df["source"] == "gps_gga"].copy()
 
 print(f"Total GGA sentences: {len(gps)}")
