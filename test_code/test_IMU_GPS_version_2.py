@@ -256,8 +256,8 @@ GPS_ENABLED = not _args.no_gps
 IMU_PORT, GPS_PORT = resolve_ports(OS_NAME, _args)
 
 # ─── IMU settings ───
-ACCEL_INPUT_IS_G = False
-IMU_ACCEL_IS_GRAVITY_FREE = True
+ACCEL_INPUT_IS_G = True
+IMU_ACCEL_IS_GRAVITY_FREE = False
 GRAVITY_MPS2 = 9.81
 IMU_BAUD = _args.imu_baud if _args.imu_baud else 115200
 
@@ -292,6 +292,7 @@ IMU_CMD_RAW = 41
 IMU_CMD_QUAT = 32
 IMU_CMD_RPY = 35
 IMU_CRC_BYTES = 2
+IMU_CMD_GRAVITY = 36
 
 # ─── Heading ───
 DEFAULT_HEADING_SIGMA_DEG = 5.0
@@ -664,6 +665,17 @@ class IMUPacketReader:
                     "roll": vals[1], "pitch": vals[2],
                     "yaw": vals[3],
                 }
+            
+            if cmd_id == 36:  # Gravity
+                if len(data) < 16:
+                    return None, None
+                vals = struct.unpack("<Ifff", data[:16])
+                return vals[0], {
+                    "packet_type": "GRAVITY",
+                    "grav_x": vals[1],
+                    "grav_y": vals[2],
+                    "grav_z": vals[3],
+                }
 
         except struct.error:
             pass
@@ -896,7 +908,7 @@ class SensorFusionEKF:
 
     def update_imu(self, gyro, accel, timestamp_us):
         if not self._orientation_initialized:
-            self.try_initialize_orientation(accel)
+            # Don't try gravity init — wait for QUAT packet
             self.last_imu_time = timestamp_us
             return False
 
@@ -1005,6 +1017,13 @@ class SensorFusionEKF:
         if not self._orientation_initialized:
             self._orientation_initialized = True
             self.has_imu = True
+            r = R.from_quat(q)
+            euler = r.as_euler('zyx', degrees=True)
+            print(
+                f"[INIT] Orientation from QUAT: "
+                f"yaw={euler[0]:.1f} pitch={euler[1]:.1f} "
+                f"roll={euler[2]:.1f}"
+            )
 
     def get_position_local(self):
         return self.x[0:3].copy()
@@ -1141,6 +1160,7 @@ def main():
     last_gps_error = None
     last_heading_deg = None
     last_valid_raw_gps = None
+    last_gravity = np.array([0.0, 0.0, -1.0])  # persistent gravity vector
 
     if gps_ser is not None:
         print(f"Waiting for GPS fix ({GPS_FIX_TIMEOUT_S}s)...")
@@ -1159,19 +1179,18 @@ def main():
                             ts, data = imu_reader.read_packet()
                             if data is None:
                                 break
-                            if data.get("packet_type") == "RAW":
-                                accel = np.array([
-                                    data["accel_x"],
-                                    data["accel_y"],
-                                    data["accel_z"],
-                                ], dtype=float)
-                                ekf.try_initialize_orientation(accel)
-                            elif data.get("packet_type") == "QUAT":
+                            if data.get("packet_type") == "QUAT":
                                 q = np.array([
                                     data["q2"], data["q3"],
                                     data["q4"], data["q1"],
                                 ], dtype=float)
                                 ekf.update_orientation_from_quat(q)
+                            elif data.get("packet_type") == "GRAVITY":
+                                last_gravity = np.array([
+                                    data["grav_x"],
+                                    data["grav_y"],
+                                    data["grav_z"],
+                                ])
                     time.sleep(0.001)
                     continue
 
@@ -1237,16 +1256,23 @@ def main():
                     imu_packets_read += 1
                     imu_batch_count += 1
 
-                    if imu_data.get("packet_type") == "RAW":
+                    if imu_data.get("packet_type") == "GRAVITY":
+                        last_gravity = np.array([
+                            imu_data["grav_x"],
+                            imu_data["grav_y"],
+                            imu_data["grav_z"],
+                        ])
+
+                    elif imu_data.get("packet_type") == "RAW":
                         gyro = np.array([
                             imu_data["gyro_x"],
                             imu_data["gyro_y"],
                             imu_data["gyro_z"],
                         ], dtype=float)
                         accel = np.array([
-                            imu_data["accel_x"],
-                            imu_data["accel_y"],
-                            imu_data["accel_z"],
+                            imu_data["accel_x"] + last_gravity[0],
+                            imu_data["accel_y"] + last_gravity[1],
+                            imu_data["accel_z"] + last_gravity[2],
                         ], dtype=float)
 
                         predicted = ekf.update_imu(
