@@ -377,7 +377,7 @@ def parse_args():
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--log-imu-raw", action="store_true",
                         help="Log every IMU packet to imu_raw.csv (~50MB/hr)")
-    parser.add_argument("--dr-log-decimation", type=int, default=10,
+    parser.add_argument("--dr-log-decimation", type=int, default=1,
                         help="Log every Nth DR prediction to position.csv "
                              "(default=10 → 40Hz from 400Hz IMU)")
     return parser.parse_args()
