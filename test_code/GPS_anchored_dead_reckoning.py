@@ -25,6 +25,59 @@ Logging:
   - position.csv:  GPS fixes + decimated DR predictions
   - gps_raw.csv:   every valid GPS fix with quality info
   - imu_raw.csv:   every IMU RAW packet (optional: --log-imu-raw)
+  
+--------------------------------------------------------------------------
+┌──────────────────┐
+│  IMU Reader       │ ──→ event_q ──→ ┌──────────────┐
+│  (serial→parse)   │                  │  Main Thread  │
+└──────────────────┘                  │              │
+                                      │  drain events │
+┌──────────────────┐                  │  in FIFO order│
+│  GPS Reader       │ ──→ event_q ──→ │              │
+│  (serial→parse)   │                  │  DR engine   │
+└──────────────────┘                  │              │
+                                      │  push log rows│
+                                      └──────┬───────┘
+                                             │
+                        ┌────────────────────┼────────────────────┐
+                        ▼                    ▼                    ▼
+               ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+               │ pos CSV writer│    │ gps CSV writer│    │ imu CSV writer│
+               │ (async thread)│    │ (async thread)│    │ (async thread)│
+               └──────────────┘    └──────────────┘    └──────────────┘
+
+Total threads: 2 readers + 1 main + 2-3 log writers = 5-6 threads
+All I/O is off the main thread. Main thread only does math + queue ops.
+
+--------------------------------------------------------------------------
+The three stages if missing GPS:
+
+GPS normal     GPS gone 2s        GPS gone 10s         GPS returns
+─────────────┬──────────────────┬────────────────────┬──────────────
+             │                  │                    │
+  DR running │  [WARN] printed  │  [CLAMP] vel=0     │  Hard reset
+  vel from   │  DR continues    │  pos frozen         │  pos = GPS
+  GPS-derived│  drift growing   │  orientation still  │  vel = new
+             │                  │  updating           │  flags cleared
+             │                  │                    │
+  mode:      │  mode:           │  mode:             │  mode:
+  "GPS-      │  "GPS-anchored   │  "GPS DROPOUT      │  "GPS-anchored
+  anchored   │   DR (GPS stale)"│   (frozen)"        │   dead reckoning"
+  dead       │                  │                    │
+  reckoning" │                  │                    │
+
+--------------------------------------------------------------------------
+
+Scenario: No QUAT packets, identity orientation, start moving
+
+Time:     0s          0.1s        0.2s        0.3s        0.4s
+GPS:      A           B           C           D           E
+          │           │           │           │           │
+          ├─40 IMU──→├─40 IMU──→├─40 IMU──→├─40 IMU──→│
+          │           │           │           │           │
+Heading:      WRONG     CORRECT       CORRECT     CORRECT     CORRECT
+           (identity)  (from A→B)   (from B→C)  (from C→D)
+  
 """
 
 import numpy as np
