@@ -9,72 +9,239 @@ Created on Thu Apr 16 16:06:36 2026
 import serial
 import struct
 import numpy as np
+import time
+
+
+SYNC_1 = 0xAA
+SYNC_2 = 0x55
+
+CMD_QUAT = 32
+CMD_RPY = 35
+CMD_RAW = 41
+
+G_TO_MPS2 = 9.8158
+
+
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+
+    return crc & 0xFFFF
+
+
+def read_exact(ser, n):
+    buf = bytearray()
+
+    while len(buf) < n:
+        chunk = ser.read(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+
+    return bytes(buf)
+
 
 def parse_imu_packet(ser):
     while True:
-        # 1. Sync with Header
         b1 = ser.read(1)
-        if b1 != b'\xAA': continue
+        if not b1:
+            return None, {}
+
+        if b1[0] != SYNC_1:
+            continue
+
         b2 = ser.read(1)
-        if b2 != b'\x55': continue
-            
-        # 2. Read Length
+        if not b2:
+            return None, {}
+
+        if b2[0] != SYNC_2:
+            continue
+
         length_byte = ser.read(1)
-        if not length_byte: return None, {}
+        if not length_byte:
+            return None, {}
+
         length = length_byte[0]
-        
-        # 3. Read Payload
-        payload = ser.read(length)
-        if len(payload) < length: return None, {}
-            
-        # 4. Check Command ID
-        header_info = struct.unpack('<I', payload[:4])[0]
+
+        payload = read_exact(ser, length)
+        if payload is None:
+            return None, {}
+
+        crc_bytes = read_exact(ser, 2)
+        if crc_bytes is None:
+            return None, {}
+
+        crc_received = struct.unpack("<H", crc_bytes)[0]
+        crc_calculated = crc16_modbus(length_byte + payload)
+
+        if crc_received != crc_calculated:
+            continue
+
+        if len(payload) < 4:
+            continue
+
+        header_info = struct.unpack("<I", payload[:4])[0]
         cmd_id = header_info & 0x7F
-        
-        if cmd_id == 41:
-            data_to_unpack = payload[4:]
-            data_len = len(data_to_unpack)
-            
-            # Determine how many floats we can actually unpack
-            # 4 bytes for Timestamp (I) + 4 bytes for each Float (f)
-            # If we have at least 28 bytes: Timestamp + 3 Accel + 3 Gyro
-            if data_len >= 28:
-                # Dynamically build the format string based on available data
-                # We subtract 4 for the 'I', then divide the rest by 4 for 'f's
-                num_floats = (data_len - 4) // 4
-                fmt = '<I' + ('f' * num_floats)
-                
-                # Only slice exactly what the format string needs
-                required_bytes = 4 + (num_floats * 4)
-                vals = struct.unpack(fmt, data_to_unpack[:required_bytes])
-                
-                return vals[0], {
-                    'accel_x': vals[1], 'accel_y': vals[2], 'accel_z': vals[3],
-                    'gyro_x': vals[4], 'gyro_y': vals[5], 'gyro_z': vals[6]
-                }
+
+        data = payload[4:]
+
+        if cmd_id == CMD_RAW:
+            if len(data) < 28:
+                return None, {}
+
+            num_floats = (len(data) - 4) // 4
+            fmt = "<I" + "f" * num_floats
+            required_bytes = 4 + num_floats * 4
+
+            vals = struct.unpack(fmt, data[:required_bytes])
+
+            timestamp_us = vals[0]
+
+            gyro_x = vals[1]
+            gyro_y = vals[2]
+            gyro_z = vals[3]
+
+            accel_x_g = vals[4]
+            accel_y_g = vals[5]
+            accel_z_g = vals[6]
+
+            result = {
+                "packet_type": "RAW",
+
+                "gyro_x": gyro_x,
+                "gyro_y": gyro_y,
+                "gyro_z": gyro_z,
+
+                "accel_x_g": accel_x_g,
+                "accel_y_g": accel_y_g,
+                "accel_z_g": accel_z_g,
+
+                "accel_x_mps2": accel_x_g * G_TO_MPS2,
+                "accel_y_mps2": accel_y_g * G_TO_MPS2,
+                "accel_z_mps2": accel_z_g * G_TO_MPS2,
+            }
+
+            if num_floats >= 9:
+                result["mag_x"] = vals[7]
+                result["mag_y"] = vals[8]
+                result["mag_z"] = vals[9]
+
+            return timestamp_us, result
+
+        if cmd_id == CMD_RPY:
+            if len(data) < 16:
+                return None, {}
+
+            vals = struct.unpack("<Ifff", data[:16])
+
+            return vals[0], {
+                "packet_type": "RPY",
+                "roll": vals[1],
+                "pitch": vals[2],
+                "yaw": vals[3],
+            }
+
+        if cmd_id == CMD_QUAT:
+            if len(data) < 20:
+                return None, {}
+
+            vals = struct.unpack("<Iffff", data[:20])
+
+            return vals[0], {
+                "packet_type": "QUAT",
+                "q1": vals[1],
+                "q2": vals[2],
+                "q3": vals[3],
+                "q4": vals[4],
+            }
+
         return None, {}
 
-# --- REST OF YOUR CODE (Setup and While Loop) ---
-port_name = 'COM12' 
-baud_rate = 115200
 
-try:
-    imu_ser = serial.Serial(port_name, baud_rate, timeout=0.1)
-    print(f"--- Monitoring Raw Data on {port_name} ---")
+def main():
+    port_name = "COM12"
+    baud_rate = 115200
 
-    while True:
-        imu_timestamp, imu_data = parse_imu_packet(imu_ser)
-        if imu_data:
-            gyro = np.array([imu_data.get('gyro_x'), imu_data.get('gyro_y'), imu_data.get('gyro_z')])
-            accel = np.array([imu_data.get('accel_x'), imu_data.get('accel_y'), imu_data.get('accel_z')])
-            print(f"TS: {imu_timestamp} | Accel: {accel} | Gyro: {gyro}")
-            
-except KeyboardInterrupt:
-    print("\nStopped.")
-finally:
-    if 'imu_ser' in locals(): imu_ser.close()
+    imu_ser = serial.Serial(
+        port=port_name,
+        baudrate=baud_rate,
+        timeout=0.1
+    )
+
+    print(f"Monitoring IMU on {port_name}")
+
+    try:
+        while True:
+            imu_timestamp, imu_data = parse_imu_packet(imu_ser)
+
+            if not imu_data:
+                continue
+
+            packet_type = imu_data["packet_type"]
+
+            if packet_type == "RAW":
+                gyro = np.array([
+                    imu_data["gyro_x"],
+                    imu_data["gyro_y"],
+                    imu_data["gyro_z"],
+                ], dtype=float)
+
+                accel_g = np.array([
+                    imu_data["accel_x_g"],
+                    imu_data["accel_y_g"],
+                    imu_data["accel_z_g"],
+                ], dtype=float)
+
+                accel_mps2 = np.array([
+                    imu_data["accel_x_mps2"],
+                    imu_data["accel_y_mps2"],
+                    imu_data["accel_z_mps2"],
+                ], dtype=float)
+
+                accel_norm_g = np.linalg.norm(accel_g)
+
+                print(
+                    f"TS: {imu_timestamp} | "
+                    f"Accel g: {accel_g} | "
+                    f"Accel mps2: {accel_mps2} | "
+                    f"Accel norm g: {accel_norm_g:.4f} | "
+                    f"Gyro rad/s: {gyro}"
+                )
+
+            elif packet_type == "RPY":
+                print(
+                    f"TS: {imu_timestamp} | "
+                    f"Roll: {imu_data['roll']:.3f} | "
+                    f"Pitch: {imu_data['pitch']:.3f} | "
+                    f"Yaw: {imu_data['yaw']:.3f}"
+                )
+
+            elif packet_type == "QUAT":
+                print(
+                    f"TS: {imu_timestamp} | "
+                    f"Quat: "
+                    f"{imu_data['q1']:.6f}, "
+                    f"{imu_data['q2']:.6f}, "
+                    f"{imu_data['q3']:.6f}, "
+                    f"{imu_data['q4']:.6f}"
+                )
+
+    except KeyboardInterrupt:
+        print("Stopped.")
+
+    finally:
+        imu_ser.close()
 
 
+if __name__ == "__main__":
+    main()
 #%%
 
 import serial
