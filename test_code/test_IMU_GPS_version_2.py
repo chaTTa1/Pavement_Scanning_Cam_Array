@@ -9,18 +9,15 @@ Hardware:
     Gyro: rad/s, Timestamp: microseconds
   - GPS at ~5-10 Hz (NMEA: GGA, GST, HDT, RMC, VTG)
 
+Architecture:
+  - Thread 1: IMU reader → priority queue (by wall-clock arrival)
+  - Thread 2: GPS reader → same priority queue
+  - Main thread: dequeue in order → EKF predict/update
+
 Modes:
   - GPS+IMU: Full EKF fusion, logs position.csv
   - IMU-only: No EKF. Logs raw sensor data + integrated velocity
-              to IMU_only.csv. Uses QUAT+GRAVITY packets to compute
-              gravity-free body accel and world-frame velocity.
-
-State vector (16) — EKF mode only:
-  [0:3]   position ENU (m)
-  [3:6]   velocity ENU (m/s)
-  [6:10]  quaternion (x, y, z, w) — scipy convention
-  [10:13] gyro bias (rad/s)
-  [13:16] accel bias (g)
+              to IMU_only.csv.
 
 Usage:
   python fusion.py                          # auto-detect ports
@@ -44,6 +41,8 @@ import csv
 import os
 import sys
 import argparse
+import threading
+import queue
 from geopy.distance import geodesic
 from geopy.point import Point
 
@@ -58,7 +57,8 @@ def detect_os():
     elif sys.platform.startswith("linux"):
         return "Linux"
     else:
-        print(f"[WARNING] Unknown platform '{sys.platform}', using Linux defaults")
+        print(f"[WARNING] Unknown platform '{sys.platform}', "
+              f"using Linux defaults")
         return "Linux"
 
 
@@ -80,14 +80,12 @@ def list_serial_ports():
                 print(
                     f"  {p.device:20s} | "
                     f"VID:PID={p.vid:04X}:{p.pid:04X} | "
-                    f"{p.description}"
-                )
+                    f"{p.description}")
             else:
                 print(
                     f"  {p.device:20s} | "
                     f"VID:PID=None         | "
-                    f"{p.description}"
-                )
+                    f"{p.description}")
     except Exception as exc:
         print(f"  Error listing ports: {exc}")
 
@@ -106,7 +104,8 @@ def find_septentrio_nmea_port(timeout=3.0):
     if not septentrio_ports:
         return None
 
-    print(f"Found {len(septentrio_ports)} Septentrio ports: {septentrio_ports}")
+    print(f"Found {len(septentrio_ports)} Septentrio ports: "
+          f"{septentrio_ports}")
 
     for port in septentrio_ports:
         print(f"  Testing {port} for NMEA data...")
@@ -119,7 +118,8 @@ def find_septentrio_nmea_port(timeout=3.0):
                 try:
                     raw = ser.readline()
                     if raw:
-                        line = raw.decode("ascii", errors="ignore").strip()
+                        line = raw.decode(
+                            "ascii", errors="ignore").strip()
                         if line.startswith("$") and (
                                 "GGA" in line or "GST" in line
                                 or "HDT" in line or "RMC" in line
@@ -127,7 +127,8 @@ def find_septentrio_nmea_port(timeout=3.0):
                             nmea_count += 1
                             if nmea_count >= 3:
                                 ser.close()
-                                print(f"  -> {port} is NMEA port ({nmea_count} sentences)")
+                                print(f"  -> {port} is NMEA port "
+                                      f"({nmea_count} sentences)")
                                 return port
                 except Exception:
                     pass
@@ -143,10 +144,7 @@ def find_septentrio_nmea_port(timeout=3.0):
 
 
 def auto_detect_ports(os_name):
-    IMU_USB_IDS = [
-        (0x0483, 0x5740),
-    ]
-
+    IMU_USB_IDS = [(0x0483, 0x5740)]
     imu_port = None
     gps_port = None
 
@@ -164,14 +162,12 @@ def auto_detect_ports(os_name):
             print(
                 f"  {p.device:20s} | "
                 f"VID:PID={vid:04X}:{pid:04X} | "
-                f"{p.description}"
-            )
+                f"{p.description}")
         else:
             print(
                 f"  {p.device:20s} | "
                 f"VID:PID=None         | "
-                f"{p.description}"
-            )
+                f"{p.description}")
             continue
 
         for known_vid, known_pid in IMU_USB_IDS:
@@ -184,10 +180,8 @@ def auto_detect_ports(os_name):
 
     if gps_port is None:
         OTHER_GPS_IDS = [
-            (0x1546, 0x01A8),
-            (0x10C4, 0xEA60),
-            (0x067B, 0x2303),
-            (0x0403, 0x6001),
+            (0x1546, 0x01A8), (0x10C4, 0xEA60),
+            (0x067B, 0x2303), (0x0403, 0x6001),
         ]
         for p in ports:
             if p.vid is None:
@@ -223,8 +217,7 @@ def resolve_ports(os_name, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="GPS/IMU Sensor Fusion EKF"
-    )
+        description="GPS/IMU Sensor Fusion EKF")
     parser.add_argument("--imu-port", type=str, default=None)
     parser.add_argument("--gps-port", type=str, default=None)
     parser.add_argument("--imu-baud", type=int, default=None)
@@ -234,6 +227,8 @@ def parse_args():
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--skip-crc", action="store_true",
                         help="Disable CRC checking on IMU packets")
+    parser.add_argument("--print-every", type=float, default=0.25,
+                        help="Console print interval in seconds")
     return parser.parse_args()
 
 
@@ -252,6 +247,7 @@ OS_NAME = detect_os()
 
 IMU_ENABLED = not _args.no_imu
 GPS_ENABLED = not _args.no_gps
+PRINT_EVERY = _args.print_every
 
 IMU_PORT, GPS_PORT = resolve_ports(OS_NAME, _args)
 
@@ -280,9 +276,7 @@ MAX_EKF_ALTITUDE_OFFSET_M = 200.0
 MAX_VALID_IMU_DT = 0.02
 
 # ─── Debug ───
-PRINT_PREDICT_DEBUG = True
-PRINT_PREDICT_EVERY_N = 400
-PRINT_RAW_GPS_DEBUG = True
+PRINT_RAW_GPS_DEBUG = False
 PRINT_ALL_NMEA_LINES = False
 
 # ─── Process noise ───
@@ -313,10 +307,16 @@ GRAVITY_INIT_SAMPLES = 200
 # ─── GPS timeout ───
 GPS_FIX_TIMEOUT_S = 30
 
+# ─── Queue ───
+SENSOR_QUEUE_MAXSIZE = 2000
+
 print(f"OS: {OS_NAME}")
-print(f"IMU: {'ENABLED' if IMU_ENABLED else 'DISABLED'} | {IMU_PORT} @ {IMU_BAUD}")
-print(f"GPS: {'ENABLED' if GPS_ENABLED else 'DISABLED'} | {GPS_PORT} @ {GPS_BAUD}")
+print(f"IMU: {'ENABLED' if IMU_ENABLED else 'DISABLED'} | "
+      f"{IMU_PORT} @ {IMU_BAUD}")
+print(f"GPS: {'ENABLED' if GPS_ENABLED else 'DISABLED'} | "
+      f"{GPS_PORT} @ {GPS_BAUD}")
 print(f"CRC check: {'off' if _args.skip_crc else 'on'}")
+print(f"Print interval: {PRINT_EVERY}s")
 
 
 # ─────────────────────────────────────────────
@@ -374,7 +374,8 @@ def quaternion_to_yaw(q):
 
 
 def angle_residual(z, z_pred):
-    return np.array([normalize_angle(float(z[0]) - float(z_pred[0]))])
+    return np.array([
+        normalize_angle(float(z[0]) - float(z_pred[0]))])
 
 
 def quaternion_residual(q_meas, q_pred):
@@ -399,6 +400,11 @@ def course_speed_to_enu_velocity(course_deg, speed_mps):
     ve = speed_mps * np.sin(course_rad)
     vn = speed_mps * np.cos(course_rad)
     return ve, vn
+
+
+def format_vec(v, precision=5):
+    return "[" + ", ".join(
+        f"{x:.{precision}f}" for x in v) + "]"
 
 
 # ─────────────────────────────────────────────
@@ -499,8 +505,10 @@ def compute_Q(dt):
     Q[0:3, 0:3] = np.eye(3) * (POSITION_PROCESS_NOISE ** 2) * dt
     Q[3:6, 3:6] = np.eye(3) * (ACCEL_NOISE_DENSITY ** 2) * dt
     Q[6:10, 6:10] = np.eye(4) * (GYRO_NOISE_DENSITY ** 2) * dt
-    Q[10:13, 10:13] = np.eye(3) * (GYRO_BIAS_RANDOM_WALK ** 2) * dt
-    Q[13:16, 13:16] = np.eye(3) * (ACCEL_BIAS_RANDOM_WALK ** 2) * dt
+    Q[10:13, 10:13] = np.eye(3) * (
+        GYRO_BIAS_RANDOM_WALK ** 2) * dt
+    Q[13:16, 13:16] = np.eye(3) * (
+        ACCEL_BIAS_RANDOM_WALK ** 2) * dt
     return Q
 
 
@@ -560,12 +568,9 @@ def H_jacobian_heading(x):
         x_pert[idx] += eps
         x_pert[6:10] = normalize_quaternion(x_pert[6:10])
         perturbed_yaw = hx_heading(x_pert)[0]
-        H[0, idx] = normalize_angle(perturbed_yaw - base_yaw) / eps
+        H[0, idx] = normalize_angle(
+            perturbed_yaw - base_yaw) / eps
     return H
-
-
-def hx_quaternion(x):
-    return normalize_quaternion(x[6:10].copy())
 
 
 def H_jacobian_quaternion(x, eps=1e-7):
@@ -594,24 +599,21 @@ class PositionLogger:
 
     def _ensure_open(self):
         if self._file is None:
-            write_header = (not os.path.exists(self.filename)
-                           or os.path.getsize(self.filename) == 0)
+            write_header = (
+                not os.path.exists(self.filename)
+                or os.path.getsize(self.filename) == 0)
             self._file = open(self.filename, "a", newline="")
             self._writer = csv.writer(self._file)
             if write_header:
                 self._writer.writerow([
-                    "time", "source", "lat", "lon", "alt",
-                ])
+                    "time", "source", "lat", "lon", "alt"])
 
     def log_gps(self, gps_fix):
         self._ensure_open()
         self._writer.writerow([
-            f"{time.time():.6f}",
-            "gps",
-            gps_fix.get("lat"),
-            gps_fix.get("lon"),
-            gps_fix.get("alt"),
-        ])
+            f"{time.time():.6f}", "gps",
+            gps_fix.get("lat"), gps_fix.get("lon"),
+            gps_fix.get("alt")])
         self._auto_flush()
 
     def log_ekf(self, ekf):
@@ -620,12 +622,9 @@ class PositionLogger:
             return
         self._ensure_open()
         self._writer.writerow([
-            f"{time.time():.6f}",
-            "ekf",
-            f"{gps_pos[0]:.10f}",
-            f"{gps_pos[1]:.10f}",
-            f"{gps_pos[2]:.4f}",
-        ])
+            f"{time.time():.6f}", "ekf",
+            f"{gps_pos[0]:.10f}", f"{gps_pos[1]:.10f}",
+            f"{gps_pos[2]:.4f}"])
         self._auto_flush()
 
     def _auto_flush(self):
@@ -652,25 +651,6 @@ class PositionLogger:
 # ─────────────────────────────────────────────
 
 class IMUOnlyLogger:
-    """
-    Logs raw IMU sensor data + integrated velocity when running
-    without GPS. No EKF — just raw data and simple integration.
-    
-    Columns:
-      time_s          — wall-clock time (seconds since epoch)
-      imu_ts_us       — IMU hardware timestamp (microseconds)
-      dt              — time step used for integration (seconds)
-      gyro_x_rad_s, gyro_y_rad_s, gyro_z_rad_s
-      accel_x_g, accel_y_g, accel_z_g        — raw accel (includes gravity)
-      gravity_x_g, gravity_y_g, gravity_z_g  — gravity estimate from AHRS
-      linear_x_g, linear_y_g, linear_z_g     — body-frame gravity-free accel
-      mag_x, mag_y, mag_z
-      quat_w, quat_x, quat_y, quat_z         — AHRS orientation
-      roll_deg, pitch_deg, yaw_deg
-      vel_e_mps, vel_n_mps, vel_u_mps         — integrated world velocity
-      speed_mps                                — horizontal speed
-    """
-
     HEADER = [
         "time_s", "imu_ts_us", "dt",
         "gyro_x_rad_s", "gyro_y_rad_s", "gyro_z_rad_s",
@@ -691,38 +671,30 @@ class IMUOnlyLogger:
         self._writer.writerow(self.HEADER)
         self._count = 0
 
-    def write_row(
-        self,
-        wall_time,
-        imu_ts_us,
-        dt,
-        gyro,
-        accel_g,
-        gravity_g,
-        linear_g,
-        mag,
-        quat_wxyz,
-        euler_deg,
-        vel_enu,
-    ):
+    def write_row(self, wall_time, imu_ts_us, dt, gyro,
+                  accel_g, gravity_g, linear_g, mag,
+                  quat_wxyz, euler_deg, vel_enu):
         speed_h = math.sqrt(vel_enu[0] ** 2 + vel_enu[1] ** 2)
-
         self._writer.writerow([
-            f"{wall_time:.6f}",
-            imu_ts_us,
-            f"{dt:.6f}",
-            f"{gyro[0]:.9f}", f"{gyro[1]:.9f}", f"{gyro[2]:.9f}",
-            f"{accel_g[0]:.9f}", f"{accel_g[1]:.9f}", f"{accel_g[2]:.9f}",
-            f"{gravity_g[0]:.9f}", f"{gravity_g[1]:.9f}", f"{gravity_g[2]:.9f}",
-            f"{linear_g[0]:.9f}", f"{linear_g[1]:.9f}", f"{linear_g[2]:.9f}",
-            f"{mag[0]:.9f}", f"{mag[1]:.9f}", f"{mag[2]:.9f}",
+            f"{wall_time:.6f}", imu_ts_us, f"{dt:.6f}",
+            f"{gyro[0]:.9f}", f"{gyro[1]:.9f}",
+            f"{gyro[2]:.9f}",
+            f"{accel_g[0]:.9f}", f"{accel_g[1]:.9f}",
+            f"{accel_g[2]:.9f}",
+            f"{gravity_g[0]:.9f}", f"{gravity_g[1]:.9f}",
+            f"{gravity_g[2]:.9f}",
+            f"{linear_g[0]:.9f}", f"{linear_g[1]:.9f}",
+            f"{linear_g[2]:.9f}",
+            f"{mag[0]:.9f}", f"{mag[1]:.9f}",
+            f"{mag[2]:.9f}",
             f"{quat_wxyz[0]:.9f}", f"{quat_wxyz[1]:.9f}",
             f"{quat_wxyz[2]:.9f}", f"{quat_wxyz[3]:.9f}",
-            f"{euler_deg[0]:.4f}", f"{euler_deg[1]:.4f}", f"{euler_deg[2]:.4f}",
-            f"{vel_enu[0]:.6f}", f"{vel_enu[1]:.6f}", f"{vel_enu[2]:.6f}",
+            f"{euler_deg[0]:.4f}", f"{euler_deg[1]:.4f}",
+            f"{euler_deg[2]:.4f}",
+            f"{vel_enu[0]:.6f}", f"{vel_enu[1]:.6f}",
+            f"{vel_enu[2]:.6f}",
             f"{speed_h:.6f}",
         ])
-
         self._count += 1
         if self._count % 500 == 0:
             self._file.flush()
@@ -736,7 +708,8 @@ class IMUOnlyLogger:
             self._file.flush()
             self._file.close()
             self._file = None
-            print(f"[IMU-ONLY] Saved {self._count} rows to {self.filename}")
+            print(f"[IMU-ONLY] Saved {self._count} rows "
+                  f"to {self.filename}")
 
     def __del__(self):
         self.close()
@@ -747,64 +720,48 @@ class IMUOnlyLogger:
 # ─────────────────────────────────────────────
 
 class IMUOnlyProcessor:
-    """
-    Processes raw IMU data without EKF.
-    
-    Uses GRAVITY packet from AHRS to compute gravity-free body accel:
-        linear_body = raw_accel - gravity_packet
-    
-    Uses QUAT packet from AHRS to rotate linear accel to world frame,
-    then integrates velocity via trapezoidal rule.
-    
-    No position integration (pure double-integration drifts too fast
-    to be useful without GPS corrections).
-    """
-
     def __init__(self):
-        # Latest AHRS outputs
         self.gravity_g = np.array([0.0, 0.0, -1.0])
-        self.quat_scipy = np.array([0.0, 0.0, 0.0, 1.0])  # xyzw
-        self.euler_deg = np.array([0.0, 0.0, 0.0])  # yaw, pitch, roll
+        self.quat_scipy = np.array([0.0, 0.0, 0.0, 1.0])
+        self.euler_deg = np.array([0.0, 0.0, 0.0])
         self.has_quat = False
         self.has_gravity = False
 
-        # Velocity integration state
         self.vel_enu = np.array([0.0, 0.0, 0.0])
         self.prev_linear_world_mps2 = None
 
-        # Timestamp tracking
         self.last_imu_ts_us = None
 
-        # Counters
         self.raw_count = 0
         self.gravity_count = 0
         self.quat_count = 0
+        self.rpy_count = 0
 
-    def feed_gravity(self, gravity_x_g, gravity_y_g, gravity_z_g):
-        self.gravity_g = np.array([
-            gravity_x_g, gravity_y_g, gravity_z_g,
-        ])
+        self.latest_raw = None
+        self.latest_rpy = None
+
+    def feed_gravity(self, gx, gy, gz):
+        self.gravity_g = np.array([gx, gy, gz])
         self.has_gravity = True
         self.gravity_count += 1
 
     def feed_quat(self, q1, q2, q3, q4):
-        """q1=w, q2=x, q3=y, q4=z in device convention → scipy xyzw."""
         self.quat_scipy = normalize_quaternion(
-            np.array([q2, q3, q4, q1], dtype=float)
-        )
+            np.array([q2, q3, q4, q1], dtype=float))
         r = R.from_quat(self.quat_scipy)
         self.euler_deg = r.as_euler('zyx', degrees=True)
         self.has_quat = True
         self.quat_count += 1
 
+    def feed_rpy(self, roll_deg, pitch_deg, yaw_deg):
+        self.latest_rpy = {
+            "roll": roll_deg, "pitch": pitch_deg,
+            "yaw": yaw_deg}
+        self.rpy_count += 1
+
     def process_raw(self, imu_ts_us, gyro, accel_g, mag):
-        """
-        Process one RAW packet. Returns dict with all computed values,
-        or None if not ready (waiting for first QUAT/GRAVITY).
-        """
         self.raw_count += 1
 
-        # Compute dt from IMU timestamps
         dt = 0.0
         if self.last_imu_ts_us is not None:
             raw_diff = imu_ts_us - self.last_imu_ts_us
@@ -815,43 +772,37 @@ class IMUOnlyProcessor:
                 dt = 0.0
         self.last_imu_ts_us = imu_ts_us
 
-        # Gravity-free body acceleration
         linear_body_g = accel_g - self.gravity_g
         linear_body_mps2 = linear_body_g * GRAVITY_MPS2
 
-        # Rotate to world frame and integrate velocity
         if self.has_quat and dt > 0:
             rot = R.from_quat(self.quat_scipy)
             linear_world_mps2 = rot.apply(linear_body_mps2)
 
-            # Trapezoidal integration
             if self.prev_linear_world_mps2 is not None:
                 avg_accel = 0.5 * (
-                    self.prev_linear_world_mps2 + linear_world_mps2
-                )
+                    self.prev_linear_world_mps2
+                    + linear_world_mps2)
                 self.vel_enu += avg_accel * dt
             else:
                 self.vel_enu += linear_world_mps2 * dt
 
-            self.prev_linear_world_mps2 = linear_world_mps2.copy()
+            self.prev_linear_world_mps2 = (
+                linear_world_mps2.copy())
 
-        return {
-            "imu_ts_us": imu_ts_us,
-            "dt": dt,
-            "gyro": gyro,
-            "accel_g": accel_g,
+        result = {
+            "imu_ts_us": imu_ts_us, "dt": dt,
+            "gyro": gyro, "accel_g": accel_g,
             "gravity_g": self.gravity_g.copy(),
-            "linear_g": linear_body_g,
-            "mag": mag,
+            "linear_g": linear_body_g, "mag": mag,
             "quat_wxyz": np.array([
-                self.quat_scipy[3],
-                self.quat_scipy[0],
-                self.quat_scipy[1],
-                self.quat_scipy[2],
-            ]),
+                self.quat_scipy[3], self.quat_scipy[0],
+                self.quat_scipy[1], self.quat_scipy[2]]),
             "euler_deg": self.euler_deg.copy(),
             "vel_enu": self.vel_enu.copy(),
         }
+        self.latest_raw = result
+        return result
 
 
 # ─────────────────────────────────────────────
@@ -869,7 +820,8 @@ class IMUPacketReader:
     def _refill(self):
         avail = self.ser.in_waiting
         if avail > 0:
-            self._buf.extend(self.ser.read(min(avail, 4096)))
+            self._buf.extend(
+                self.ser.read(min(avail, 4096)))
 
     def read_packet(self):
         self._refill()
@@ -901,13 +853,16 @@ class IMUPacketReader:
 
             length_byte = bytes([length])
             payload = bytes(self._buf[3:3 + length])
-            crc_bytes = bytes(self._buf[3 + length:3 + length + 2])
+            crc_bytes = bytes(
+                self._buf[3 + length:3 + length + 2])
 
             self._buf = self._buf[total_needed:]
 
             if self.check_crc:
-                crc_received = struct.unpack("<H", crc_bytes)[0]
-                crc_calculated = crc16_modbus(length_byte + payload)
+                crc_received = struct.unpack(
+                    "<H", crc_bytes)[0]
+                crc_calculated = crc16_modbus(
+                    length_byte + payload)
 
                 if crc_received != crc_calculated:
                     self.crc_fail_count += 1
@@ -920,7 +875,8 @@ class IMUPacketReader:
             header = struct.unpack("<I", payload[:4])[0]
             cmd_id = header & 0x7F
 
-            timestamp, data = self._parse_packet(cmd_id, payload[4:])
+            timestamp, data = self._parse_packet(
+                cmd_id, payload[4:])
             if timestamp is not None and data is not None:
                 return timestamp, data
 
@@ -930,12 +886,11 @@ class IMUPacketReader:
             if cmd_id == IMU_CMD_RAW:
                 if len(data) < 28:
                     return None, None
-
                 num_floats = (len(data) - 4) // 4
                 fmt = "<I" + ("f" * num_floats)
                 required_bytes = 4 + num_floats * 4
-                vals = struct.unpack(fmt, data[:required_bytes])
-
+                vals = struct.unpack(
+                    fmt, data[:required_bytes])
                 result = {
                     "packet_type": "RAW",
                     "gyro_x_rad_s": vals[1],
@@ -945,7 +900,6 @@ class IMUPacketReader:
                     "accel_y_g": vals[5],
                     "accel_z_g": vals[6],
                 }
-
                 if num_floats >= 9:
                     result["mag_x"] = vals[7]
                     result["mag_y"] = vals[8]
@@ -954,75 +908,50 @@ class IMUPacketReader:
                     result["mag_x"] = math.nan
                     result["mag_y"] = math.nan
                     result["mag_z"] = math.nan
-
                 return vals[0], result
 
             if cmd_id == IMU_CMD_QUAT:
                 if len(data) < 20:
                     return None, None
-
                 vals = struct.unpack("<Iffff", data[:20])
-
                 return vals[0], {
                     "packet_type": "QUAT",
-                    "q1": vals[1],
-                    "q2": vals[2],
-                    "q3": vals[3],
-                    "q4": vals[4],
-                }
+                    "q1": vals[1], "q2": vals[2],
+                    "q3": vals[3], "q4": vals[4]}
 
             if cmd_id == IMU_CMD_RPY:
                 if len(data) < 16:
                     return None, None
-
                 vals = struct.unpack("<Ifff", data[:16])
-
                 return vals[0], {
                     "packet_type": "RPY",
                     "roll_deg": vals[1],
                     "pitch_deg": vals[2],
-                    "yaw_deg": vals[3],
-                }
+                    "yaw_deg": vals[3]}
 
             if cmd_id == IMU_CMD_GRAVITY:
                 if len(data) < 16:
                     return None, None
-
                 vals = struct.unpack("<Ifff", data[:16])
-
                 return vals[0], {
                     "packet_type": "GRAVITY",
                     "gravity_x_g": vals[1],
                     "gravity_y_g": vals[2],
-                    "gravity_z_g": vals[3],
-                }
+                    "gravity_z_g": vals[3]}
 
         except struct.error:
             return None, None
-
         return None, None
 
 
 # ─────────────────────────────────────────────
-# GPS LINE READER
+# GPS LINE PARSER (no serial read — just parse)
 # ─────────────────────────────────────────────
 
-def read_gps_line(ser, last_valid_raw_gps=None):
-    try:
-        raw_bytes = ser.readline()
-        if not raw_bytes:
-            return None
-        line = raw_bytes.decode("ascii", errors="strict").strip()
-    except UnicodeDecodeError:
-        return None
-    except (KeyboardInterrupt, SystemExit):
-        raise
-
+def parse_gps_line(line, last_valid_raw_gps=None):
+    """Parse a single NMEA line string. Returns dict or None."""
     if not line:
         return None
-
-    if PRINT_ALL_NMEA_LINES:
-        print(f"[NMEA] {line}")
 
     if not line.startswith("$"):
         return None
@@ -1067,38 +996,31 @@ def read_gps_line(ser, last_valid_raw_gps=None):
                 except ValueError:
                     pass
 
-            if PRINT_RAW_GPS_DEBUG:
-                print(
-                    f"[GGA] lat={lat} lon={lon} alt={alt} "
-                    f"fix={fix_quality} sats={num_sats} hdop={hdop}"
-                )
-
             if lat is None or lon is None:
                 return None
 
-            if fix_quality is None or fix_quality < MIN_FIX_QUALITY:
+            if (fix_quality is None
+                    or fix_quality < MIN_FIX_QUALITY):
                 return {
                     "type": "GGA", "valid": False,
                     "lat": lat, "lon": lon, "alt": alt,
-                    "hdop": hdop, "fix_quality": fix_quality,
-                    "num_sats": num_sats,
-                }
+                    "hdop": hdop,
+                    "fix_quality": fix_quality,
+                    "num_sats": num_sats}
 
             if last_valid_raw_gps is not None:
                 try:
                     jump_m = geodesic(
                         (last_valid_raw_gps["lat"],
                          last_valid_raw_gps["lon"]),
-                        (lat, lon)
-                    ).meters
+                        (lat, lon)).meters
                     if jump_m > MAX_RAW_GPS_JUMP_M:
-                        print(f"[GGA REJECTED] Jump {jump_m:.1f} m")
                         return {
                             "type": "GGA", "valid": False,
-                            "lat": lat, "lon": lon, "alt": alt,
-                            "hdop": hdop, "fix_quality": fix_quality,
-                            "num_sats": num_sats,
-                        }
+                            "lat": lat, "lon": lon,
+                            "alt": alt, "hdop": hdop,
+                            "fix_quality": fix_quality,
+                            "num_sats": num_sats}
                 except Exception:
                     pass
 
@@ -1106,8 +1028,7 @@ def read_gps_line(ser, last_valid_raw_gps=None):
                 "type": "GGA", "valid": True,
                 "lat": lat, "lon": lon, "alt": alt,
                 "hdop": hdop, "fix_quality": fix_quality,
-                "num_sats": num_sats,
-            }
+                "num_sats": num_sats}
 
         if isinstance(msg, pynmea2.types.talker.RMC):
             speed_knots = None
@@ -1117,12 +1038,14 @@ def read_gps_line(ser, last_valid_raw_gps=None):
             if status == 'A':
                 if msg.spd_over_grnd not in (None, ""):
                     try:
-                        speed_knots = float(msg.spd_over_grnd)
+                        speed_knots = float(
+                            msg.spd_over_grnd)
                     except ValueError:
                         pass
                 if msg.true_course not in (None, ""):
                     try:
-                        course_deg = float(msg.true_course)
+                        course_deg = float(
+                            msg.true_course)
                     except ValueError:
                         pass
 
@@ -1130,20 +1053,10 @@ def read_gps_line(ser, last_valid_raw_gps=None):
             if speed_knots is not None:
                 speed_mps = speed_knots * 0.514444
 
-            result = {
-                "type": "RMC",
-                "speed_mps": speed_mps,
+            return {
+                "type": "RMC", "speed_mps": speed_mps,
                 "course_deg": course_deg,
-                "valid": status == 'A',
-            }
-
-            if speed_mps is not None and PRINT_RAW_GPS_DEBUG:
-                print(
-                    f"[RMC] speed={speed_mps:.2f} m/s "
-                    f"course={course_deg}° valid={status == 'A'}"
-                )
-
-            return result
+                "valid": status == 'A'}
 
         if isinstance(msg, pynmea2.types.talker.VTG):
             speed_kmh = None
@@ -1152,7 +1065,8 @@ def read_gps_line(ser, last_valid_raw_gps=None):
             if hasattr(msg, 'spd_over_grnd_kmph'):
                 if msg.spd_over_grnd_kmph not in (None, ""):
                     try:
-                        speed_kmh = float(msg.spd_over_grnd_kmph)
+                        speed_kmh = float(
+                            msg.spd_over_grnd_kmph)
                     except ValueError:
                         pass
             if hasattr(msg, 'true_track'):
@@ -1166,35 +1080,30 @@ def read_gps_line(ser, last_valid_raw_gps=None):
             if speed_kmh is not None:
                 speed_mps = speed_kmh / 3.6
 
-            result = {
-                "type": "VTG",
-                "speed_mps": speed_mps,
-                "course_deg": course_deg,
-            }
-
-            if speed_mps is not None and PRINT_RAW_GPS_DEBUG:
-                print(
-                    f"[VTG] speed={speed_mps:.2f} m/s "
-                    f"course={course_deg}°"
-                )
-
-            return result
+            return {
+                "type": "VTG", "speed_mps": speed_mps,
+                "course_deg": course_deg}
 
         if isinstance(msg, pynmea2.types.talker.GST):
-            lat_err = (float(msg.data[5])
-                       if len(msg.data) > 5 and msg.data[5] else None)
-            lon_err = (float(msg.data[6])
-                       if len(msg.data) > 6 and msg.data[6] else None)
-            alt_err = (float(msg.data[7])
-                       if len(msg.data) > 7 and msg.data[7] else None)
+            lat_err = (
+                float(msg.data[5])
+                if len(msg.data) > 5 and msg.data[5]
+                else None)
+            lon_err = (
+                float(msg.data[6])
+                if len(msg.data) > 6 and msg.data[6]
+                else None)
+            alt_err = (
+                float(msg.data[7])
+                if len(msg.data) > 7 and msg.data[7]
+                else None)
             return {
-                "type": "GST",
-                "lat_err": lat_err, "lon_err": lon_err,
-                "alt_err": alt_err,
-            }
+                "type": "GST", "lat_err": lat_err,
+                "lon_err": lon_err, "alt_err": alt_err}
 
         if isinstance(msg, pynmea2.types.talker.HDT):
-            heading = float(msg.heading) if msg.heading else None
+            heading = (float(msg.heading)
+                       if msg.heading else None)
             return {"type": "HDT", "heading_deg": heading}
 
         return None
@@ -1215,7 +1124,6 @@ class GPSVelocityTracker:
         self._prev_gga_lat = None
         self._prev_gga_lon = None
         self._prev_gga_alt = None
-
         self._rmc_vtg_speed_mps = None
         self._rmc_vtg_course_deg = None
         self._rmc_vtg_time = None
@@ -1226,7 +1134,8 @@ class GPSVelocityTracker:
             self._rmc_vtg_course_deg = course_deg
             self._rmc_vtg_time = time.time()
 
-    def feed_gga_and_get_velocity(self, lat, lon, alt, reference_gps):
+    def feed_gga_and_get_velocity(self, lat, lon, alt,
+                                  reference_gps):
         now = time.time()
 
         if (self._rmc_vtg_speed_mps is not None
@@ -1237,44 +1146,39 @@ class GPSVelocityTracker:
             course = self._rmc_vtg_course_deg
 
             if course is not None and speed > 0.3:
-                ve, vn = course_speed_to_enu_velocity(course, speed)
+                ve, vn = course_speed_to_enu_velocity(
+                    course, speed)
                 vu = 0.0
 
                 if (self._prev_gga_time is not None
                         and self._prev_gga_alt is not None
                         and alt is not None):
                     dt_gga = now - self._prev_gga_time
-                    if GPS_VEL_FDIFF_MIN_DT < dt_gga < GPS_VEL_FDIFF_MAX_DT:
-                        vu = (alt - self._prev_gga_alt) / dt_gga
+                    if (GPS_VEL_FDIFF_MIN_DT < dt_gga
+                            < GPS_VEL_FDIFF_MAX_DT):
+                        vu = ((alt - self._prev_gga_alt)
+                              / dt_gga)
 
                 self._prev_gga_time = now
                 self._prev_gga_lat = lat
                 self._prev_gga_lon = lon
                 self._prev_gga_alt = alt
-
                 self._rmc_vtg_speed_mps = None
                 self._rmc_vtg_course_deg = None
 
-                return (
-                    np.array([ve, vn, vu]),
-                    GPS_VEL_RMC_SIGMA_MPS,
-                    "rmc",
-                )
+                return (np.array([ve, vn, vu]),
+                        GPS_VEL_RMC_SIGMA_MPS, "rmc")
 
             elif speed <= 0.3:
                 self._prev_gga_time = now
                 self._prev_gga_lat = lat
                 self._prev_gga_lon = lon
                 self._prev_gga_alt = alt
-
                 self._rmc_vtg_speed_mps = None
                 self._rmc_vtg_course_deg = None
 
-                return (
-                    np.array([0.0, 0.0, 0.0]),
-                    GPS_VEL_RMC_SIGMA_MPS * 2.0,
-                    "rmc",
-                )
+                return (np.array([0.0, 0.0, 0.0]),
+                        GPS_VEL_RMC_SIGMA_MPS * 2.0, "rmc")
 
         if (self._prev_gga_time is not None
                 and self._prev_gga_lat is not None
@@ -1282,41 +1186,38 @@ class GPSVelocityTracker:
 
             dt_gga = now - self._prev_gga_time
 
-            if GPS_VEL_FDIFF_MIN_DT < dt_gga < GPS_VEL_FDIFF_MAX_DT:
+            if (GPS_VEL_FDIFF_MIN_DT < dt_gga
+                    < GPS_VEL_FDIFF_MAX_DT):
                 try:
                     de = geodesic(
-                        (reference_gps[0], self._prev_gga_lon),
-                        (reference_gps[0], lon)
-                    ).meters
+                        (reference_gps[0],
+                         self._prev_gga_lon),
+                        (reference_gps[0], lon)).meters
                     if lon < self._prev_gga_lon:
                         de = -de
 
                     dn = geodesic(
-                        (self._prev_gga_lat, reference_gps[1]),
-                        (lat, reference_gps[1])
-                    ).meters
+                        (self._prev_gga_lat,
+                         reference_gps[1]),
+                        (lat, reference_gps[1])).meters
                     if lat < self._prev_gga_lat:
                         dn = -dn
 
                     ve = de / dt_gga
                     vn = dn / dt_gga
-
                     vu = 0.0
                     if (alt is not None
                             and self._prev_gga_alt is not None):
-                        vu = (alt - self._prev_gga_alt) / dt_gga
+                        vu = ((alt - self._prev_gga_alt)
+                              / dt_gga)
 
                     self._prev_gga_time = now
                     self._prev_gga_lat = lat
                     self._prev_gga_lon = lon
                     self._prev_gga_alt = alt
 
-                    return (
-                        np.array([ve, vn, vu]),
-                        GPS_VEL_FDIFF_SIGMA_MPS,
-                        "fdiff",
-                    )
-
+                    return (np.array([ve, vn, vu]),
+                            GPS_VEL_FDIFF_SIGMA_MPS, "fdiff")
                 except Exception:
                     pass
 
@@ -1324,7 +1225,6 @@ class GPSVelocityTracker:
         self._prev_gga_lat = lat
         self._prev_gga_lon = lon
         self._prev_gga_alt = alt
-
         return None, None, None
 
 
@@ -1355,6 +1255,13 @@ class SensorFusionEKF:
 
         self.gps_vel_tracker = GPSVelocityTracker()
 
+        self.latest_gps_pos = None
+        self.latest_pos_local = None
+        self.latest_vel = None
+        self.latest_yaw_deg = None
+        self.latest_euler_deg = None
+        self.latest_gps_update_info = None
+
     def set_reference_gps(self, lat, lon, alt):
         if alt is None:
             alt = 0.0
@@ -1367,27 +1274,28 @@ class SensorFusionEKF:
             return True
 
         self._init_accel_buffer.append(accel_g.copy())
-        buf_len = len(self._init_accel_buffer)
 
-        if buf_len >= GRAVITY_INIT_SAMPLES:
-            accel_avg_g = np.mean(self._init_accel_buffer, axis=0)
+        if len(self._init_accel_buffer) >= GRAVITY_INIT_SAMPLES:
+            accel_avg_g = np.mean(
+                self._init_accel_buffer, axis=0)
             accel_avg_mps2 = accel_avg_g * GRAVITY_MPS2
 
             mag = np.linalg.norm(accel_avg_mps2)
             if mag < 5.0 or mag > 15.0:
-                print(f"[INIT] Accel magnitude {mag:.2f} m/s² out of range, "
-                      f"using identity")
+                print(f"[INIT] Accel magnitude "
+                      f"{mag:.2f} m/s² out of range")
                 self.x[6:10] = [0.0, 0.0, 0.0, 1.0]
             else:
-                self.x[6:10] = initialize_orientation_from_accel(
-                    accel_avg_mps2)
+                self.x[6:10] = (
+                    initialize_orientation_from_accel(
+                        accel_avg_mps2))
                 r = R.from_quat(self.x[6:10])
                 euler = r.as_euler('zyx', degrees=True)
                 print(
                     f"[INIT] Orientation from gravity: "
-                    f"yaw={euler[0]:.1f} pitch={euler[1]:.1f} "
-                    f"roll={euler[2]:.1f} (mag={mag:.2f} m/s²)"
-                )
+                    f"yaw={euler[0]:.1f} "
+                    f"pitch={euler[1]:.1f} "
+                    f"roll={euler[2]:.1f}")
 
             self._orientation_initialized = True
             self.has_imu = True
@@ -1403,7 +1311,8 @@ class SensorFusionEKF:
         self.P = F @ self.P @ F.T + Q
         self.P = 0.5 * (self.P + self.P.T)
 
-    def _ekf_update(self, z, H, hx, R_mat, residual_fn=None):
+    def _ekf_update(self, z, H, hx, R_mat,
+                    residual_fn=None):
         if residual_fn is not None:
             y = residual_fn(z, hx)
         else:
@@ -1419,11 +1328,13 @@ class SensorFusionEKF:
         self.x[6:10] = normalize_quaternion(self.x[6:10])
 
         I_KH = np.eye(self.dim_x) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ R_mat @ K.T
+        self.P = (I_KH @ self.P @ I_KH.T
+                  + K @ R_mat @ K.T)
         self.P = 0.5 * (self.P + self.P.T)
         return True
 
-    def update_imu(self, gyro_rad_s, accel_g, timestamp_us):
+    def update_imu(self, gyro_rad_s, accel_g,
+                   timestamp_us):
         if not self._orientation_initialized:
             if not self.try_initialize_orientation(accel_g):
                 self.last_imu_time = timestamp_us
@@ -1448,22 +1359,11 @@ class SensorFusionEKF:
         self.predict(u, dt)
         self.predict_counter += 1
 
-        pos = self.x[0:3]
-        if (np.linalg.norm(pos[:2]) > MAX_EKF_POSITION_RADIUS_M
-                or abs(pos[2]) > MAX_EKF_ALTITUDE_OFFSET_M):
-            print(
-                f"[STATE WARNING] EKF diverging: "
-                f"pos=({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
-            )
-
-        if (PRINT_PREDICT_DEBUG
-                and self.predict_counter % PRINT_PREDICT_EVERY_N == 0):
-            vel = self.x[3:6]
-            print(
-                f"[PREDICT] dt={self.dt:.6f} "
-                f"pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) "
-                f"vel=({vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f})"
-            )
+        self.latest_pos_local = self.x[0:3].copy()
+        self.latest_vel = self.x[3:6].copy()
+        self.latest_yaw_deg = self.get_yaw_deg()
+        self.latest_euler_deg = self.get_euler_deg()
+        self.latest_gps_pos = self.get_gps_position()
 
         return True
 
@@ -1475,16 +1375,18 @@ class SensorFusionEKF:
 
         try:
             e = geodesic(
-                (self.reference_gps[0], self.reference_gps[1]),
-                (self.reference_gps[0], lon)
-            ).meters
-            e *= 1.0 if lon >= self.reference_gps[1] else -1.0
+                (self.reference_gps[0],
+                 self.reference_gps[1]),
+                (self.reference_gps[0], lon)).meters
+            e *= (1.0 if lon >= self.reference_gps[1]
+                  else -1.0)
 
             n = geodesic(
-                (self.reference_gps[0], self.reference_gps[1]),
-                (lat, self.reference_gps[1])
-            ).meters
-            n *= 1.0 if lat >= self.reference_gps[0] else -1.0
+                (self.reference_gps[0],
+                 self.reference_gps[1]),
+                (lat, self.reference_gps[1])).meters
+            n *= (1.0 if lat >= self.reference_gps[0]
+                  else -1.0)
 
             if (abs(e) > MAX_EKF_POSITION_RADIUS_M
                     or abs(n) > MAX_EKF_POSITION_RADIUS_M):
@@ -1497,89 +1399,70 @@ class SensorFusionEKF:
             else:
                 h_sigma = UERE_SIGMA_M
 
-            vel_enu, vel_sigma, vel_source = \
-                self.gps_vel_tracker.feed_gga_and_get_velocity(
-                    lat, lon, alt, self.reference_gps
-                )
+            vel_enu, vel_sigma, vel_source = (
+                self.gps_vel_tracker
+                .feed_gga_and_get_velocity(
+                    lat, lon, alt, self.reference_gps))
 
             if vel_enu is not None:
-                z = np.array([e, n, u_alt,
-                              vel_enu[0], vel_enu[1], vel_enu[2]])
+                z = np.array([
+                    e, n, u_alt,
+                    vel_enu[0], vel_enu[1], vel_enu[2]])
 
-                v_h_sigma = vel_sigma
-                v_v_sigma = vel_sigma * GPS_VEL_VERTICAL_SIGMA_SCALE
+                v_h = vel_sigma
+                v_v = vel_sigma * GPS_VEL_VERTICAL_SIGMA_SCALE
 
                 R_combined = np.diag([
-                    h_sigma ** 2,
-                    h_sigma ** 2,
+                    h_sigma ** 2, h_sigma ** 2,
                     (h_sigma * 1.5) ** 2,
-                    v_h_sigma ** 2,
-                    v_h_sigma ** 2,
-                    v_v_sigma ** 2,
-                ])
+                    v_h ** 2, v_h ** 2, v_v ** 2])
 
                 H = H_jacobian_pos_vel(self.x)
                 hx = hx_pos_vel(self.x)
-                success = self._ekf_update(z, H, hx, R_combined)
+                success = self._ekf_update(
+                    z, H, hx, R_combined)
 
                 if success:
                     self.last_gps_update_time = time.time()
-                    vel_state = self.x[3:6]
-                    print(
-                        f"[GPS+VEL {vel_source}] "
-                        f"meas_v=({vel_enu[0]:.2f},{vel_enu[1]:.2f},"
-                        f"{vel_enu[2]:.2f}) "
-                        f"σ={vel_sigma:.2f} "
-                        f"state_v=({vel_state[0]:.2f},"
-                        f"{vel_state[1]:.2f},{vel_state[2]:.2f})"
-                    )
+                    self.latest_gps_update_info = {
+                        "vel_source": vel_source,
+                        "vel_meas": vel_enu.copy(),
+                        "vel_sigma": vel_sigma,
+                        "vel_state": self.x[3:6].copy()}
                 return success
-
             else:
                 z = np.array([e, n, u_alt], dtype=float)
-
                 R_pos = np.diag([
-                    h_sigma ** 2,
-                    h_sigma ** 2,
-                    (h_sigma * 1.5) ** 2
-                ])
+                    h_sigma ** 2, h_sigma ** 2,
+                    (h_sigma * 1.5) ** 2])
 
                 H = H_jacobian_position(self.x)
                 hx = hx_position(self.x)
-                success = self._ekf_update(z, H, hx, R_pos)
+                success = self._ekf_update(
+                    z, H, hx, R_pos)
 
                 if success:
                     self.last_gps_update_time = time.time()
+                    self.latest_gps_update_info = {
+                        "vel_source": None}
                 return success
 
         except Exception as exc:
-            print(f"[GPS UPDATE ERROR] {exc}")
             return False
 
-    def update_velocity_only(self, vel_enu, vel_sigma):
-        z = vel_enu.copy()
-        v_v_sigma = vel_sigma * GPS_VEL_VERTICAL_SIGMA_SCALE
-        R_vel = np.diag([
-            vel_sigma ** 2,
-            vel_sigma ** 2,
-            v_v_sigma ** 2,
-        ])
-        H = H_jacobian_velocity(self.x)
-        hx = hx_velocity(self.x)
-        return self._ekf_update(z, H, hx, R_vel)
-
     def update_heading(self, heading_deg,
-                       heading_sigma_deg=DEFAULT_HEADING_SIGMA_DEG):
+                       heading_sigma_deg=
+                       DEFAULT_HEADING_SIGMA_DEG):
         if heading_deg is None:
             return False
         yaw_meas = heading_deg_to_yaw_rad(heading_deg)
-        R_heading = np.array([[np.deg2rad(heading_sigma_deg) ** 2]])
+        R_heading = np.array([
+            [np.deg2rad(heading_sigma_deg) ** 2]])
         H = H_jacobian_heading(self.x)
         hx = hx_heading(self.x)
         return self._ekf_update(
             np.array([yaw_meas]), H, hx, R_heading,
-            residual_fn=angle_residual
-        )
+            residual_fn=angle_residual)
 
     def update_orientation_from_quat(self, q):
         q_meas = normalize_quaternion(q)
@@ -1598,16 +1481,17 @@ class SensorFusionEKF:
             euler = r.as_euler('zyx', degrees=True)
             print(
                 f"[INIT] Orientation from QUAT: "
-                f"yaw={euler[0]:.1f} pitch={euler[1]:.1f} "
-                f"roll={euler[2]:.1f}"
-            )
+                f"yaw={euler[0]:.1f} "
+                f"pitch={euler[1]:.1f} "
+                f"roll={euler[2]:.1f}")
             return True
 
         q_pred = normalize_quaternion(self.x[6:10])
         y = quaternion_residual(q_meas, q_pred)
 
         H = H_jacobian_quaternion(self.x)
-        R_quat = np.eye(3) * (QUAT_MEASUREMENT_SIGMA_RAD ** 2)
+        R_quat = np.eye(3) * (
+            QUAT_MEASUREMENT_SIGMA_RAD ** 2)
 
         S = H @ self.P @ H.T + R_quat
         try:
@@ -1620,7 +1504,8 @@ class SensorFusionEKF:
         self.x[6:10] = normalize_quaternion(self.x[6:10])
 
         I_KH = np.eye(self.dim_x) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ R_quat @ K.T
+        self.P = (I_KH @ self.P @ I_KH.T
+                  + K @ R_quat @ K.T)
         self.P = 0.5 * (self.P + self.P.T)
         return True
 
@@ -1644,20 +1529,23 @@ class SensorFusionEKF:
         if self.reference_gps is None:
             return None
         e, n, u = self.x[0:3]
-        if (np.linalg.norm([e, n]) > MAX_EKF_POSITION_RADIUS_M
+        if (np.linalg.norm([e, n])
+                > MAX_EKF_POSITION_RADIUS_M
                 or abs(u) > MAX_EKF_ALTITUDE_OFFSET_M):
             return None
         try:
             ref = self.reference_gps
-            intermediate = geodesic(meters=abs(n)).destination(
+            intermediate = geodesic(
+                meters=abs(n)).destination(
                 Point(ref[0], ref[1]),
-                0.0 if n >= 0 else 180.0
-            )
-            dest = geodesic(meters=abs(e)).destination(
-                Point(intermediate.latitude, intermediate.longitude),
-                90.0 if e >= 0 else 270.0
-            )
-            return dest.latitude, dest.longitude, ref[2] + u
+                0.0 if n >= 0 else 180.0)
+            dest = geodesic(
+                meters=abs(e)).destination(
+                Point(intermediate.latitude,
+                      intermediate.longitude),
+                90.0 if e >= 0 else 270.0)
+            return (dest.latitude, dest.longitude,
+                    ref[2] + u)
         except Exception:
             return None
 
@@ -1705,7 +1593,8 @@ def validate_gps_connection(gps_ser, timeout=3.0):
         try:
             raw = gps_ser.readline()
             if raw:
-                line = raw.decode("ascii", errors="ignore").strip()
+                line = raw.decode(
+                    "ascii", errors="ignore").strip()
                 if line.startswith("$"):
                     lines += 1
                     if lines >= 3:
@@ -1717,25 +1606,117 @@ def validate_gps_connection(gps_ser, timeout=3.0):
     return False
 
 
-def format_vec(v, precision=5):
-    return "[" + ", ".join(f"{x:.{precision}f}" for x in v) + "]"
+# ─────────────────────────────────────────────
+# SENSOR READER THREADS
+# ─────────────────────────────────────────────
+
+# Queue item format: (wall_clock_time, source, data)
+# source: "imu" or "gps"
+# For IMU: data = (imu_timestamp_us, imu_data_dict)
+# For GPS: data = gps_fix_dict (parsed NMEA)
+
+class IMUReaderThread(threading.Thread):
+    """
+    Dedicated thread for reading IMU packets.
+    Reads continuously, puts parsed packets into
+    the shared queue with wall-clock arrival time.
+    """
+
+    def __init__(self, imu_reader, sensor_queue,
+                 stop_event):
+        super().__init__(daemon=True)
+        self.imu_reader = imu_reader
+        self.queue = sensor_queue
+        self.stop_event = stop_event
+        self.packets_read = 0
+        self.queue_full_drops = 0
+
+    def run(self):
+        while not self.stop_event.is_set():
+            ts, data = self.imu_reader.read_packet()
+
+            if data is None:
+                time.sleep(0.0001)
+                continue
+
+            self.packets_read += 1
+            wall_time = time.time()
+
+            try:
+                self.queue.put_nowait(
+                    (wall_time, "imu", (ts, data)))
+            except queue.Full:
+                self.queue_full_drops += 1
+
+
+class GPSReaderThread(threading.Thread):
+    """
+    Dedicated thread for reading GPS NMEA lines.
+    Reads continuously, parses each line, puts
+    parsed results into the shared queue.
+    """
+
+    def __init__(self, gps_ser, sensor_queue,
+                 stop_event):
+        super().__init__(daemon=True)
+        self.gps_ser = gps_ser
+        self.queue = sensor_queue
+        self.stop_event = stop_event
+        self.lines_read = 0
+        self.queue_full_drops = 0
+        self.last_valid_raw_gps = None
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                raw_bytes = self.gps_ser.readline()
+                if not raw_bytes:
+                    continue
+
+                line = raw_bytes.decode(
+                    "ascii", errors="strict").strip()
+            except UnicodeDecodeError:
+                continue
+            except serial.SerialException:
+                if self.stop_event.is_set():
+                    break
+                continue
+            except Exception:
+                continue
+
+            if not line:
+                continue
+
+            gps_fix = parse_gps_line(
+                line,
+                last_valid_raw_gps=self.last_valid_raw_gps)
+
+            if gps_fix is None:
+                continue
+
+            # Track last valid GGA for jump detection
+            if (gps_fix.get("type") == "GGA"
+                    and gps_fix.get("valid")):
+                self.last_valid_raw_gps = gps_fix.copy()
+
+            self.lines_read += 1
+            wall_time = time.time()
+
+            try:
+                self.queue.put_nowait(
+                    (wall_time, "gps", gps_fix))
+            except queue.Full:
+                self.queue_full_drops += 1
 
 
 # ─────────────────────────────────────────────
-# IMU-ONLY MAIN LOOP
+# IMU-ONLY MAIN LOOP (single thread, no EKF)
 # ─────────────────────────────────────────────
 
 def run_imu_only(imu_reader):
-    """
-    IMU-only mode: no EKF, no GPS.
-    Logs all raw sensor data + gravity-free accel + integrated velocity.
-    """
     print("=" * 60)
     print("IMU-ONLY MODE — No EKF")
     print("Logging raw sensor data to IMU_only.csv")
-    print("Using GRAVITY packet for gravity removal")
-    print("Using QUAT packet for world-frame rotation")
-    print("Velocity from trapezoidal integration (will drift)")
     print("=" * 60)
 
     processor = IMUOnlyProcessor()
@@ -1744,119 +1725,138 @@ def run_imu_only(imu_reader):
     last_print_time = time.time()
     rate_start_time = time.time()
     last_rate_time = time.time()
-    print_interval = 0.25
 
     try:
         while True:
-            imu_ts, imu_data = imu_reader.read_packet()
+            got_data = False
 
-            if imu_data is None:
-                time.sleep(0.0002)
-                continue
+            while True:
+                imu_ts, imu_data = imu_reader.read_packet()
+                if imu_data is None:
+                    break
 
-            packet_type = imu_data.get("packet_type")
+                got_data = True
+                pt = imu_data.get("packet_type")
 
-            if packet_type == "GRAVITY":
-                processor.feed_gravity(
-                    imu_data["gravity_x_g"],
-                    imu_data["gravity_y_g"],
-                    imu_data["gravity_z_g"],
-                )
+                if pt == "GRAVITY":
+                    processor.feed_gravity(
+                        imu_data["gravity_x_g"],
+                        imu_data["gravity_y_g"],
+                        imu_data["gravity_z_g"])
 
-            elif packet_type == "QUAT":
-                processor.feed_quat(
-                    imu_data["q1"],
-                    imu_data["q2"],
-                    imu_data["q3"],
-                    imu_data["q4"],
-                )
+                elif pt == "QUAT":
+                    processor.feed_quat(
+                        imu_data["q1"], imu_data["q2"],
+                        imu_data["q3"], imu_data["q4"])
 
-            elif packet_type == "RAW":
-                gyro = np.array([
-                    imu_data["gyro_x_rad_s"],
-                    imu_data["gyro_y_rad_s"],
-                    imu_data["gyro_z_rad_s"],
-                ], dtype=float)
+                elif pt == "RPY":
+                    processor.feed_rpy(
+                        imu_data["roll_deg"],
+                        imu_data["pitch_deg"],
+                        imu_data["yaw_deg"])
 
-                accel = np.array([
-                    imu_data["accel_x_g"],
-                    imu_data["accel_y_g"],
-                    imu_data["accel_z_g"],
-                ], dtype=float)
+                elif pt == "RAW":
+                    gyro = np.array([
+                        imu_data["gyro_x_rad_s"],
+                        imu_data["gyro_y_rad_s"],
+                        imu_data["gyro_z_rad_s"]],
+                        dtype=float)
+                    accel = np.array([
+                        imu_data["accel_x_g"],
+                        imu_data["accel_y_g"],
+                        imu_data["accel_z_g"]],
+                        dtype=float)
+                    mag = np.array([
+                        imu_data.get("mag_x", math.nan),
+                        imu_data.get("mag_y", math.nan),
+                        imu_data.get("mag_z", math.nan)],
+                        dtype=float)
 
-                mag = np.array([
-                    imu_data.get("mag_x", math.nan),
-                    imu_data.get("mag_y", math.nan),
-                    imu_data.get("mag_z", math.nan),
-                ], dtype=float)
+                    result = processor.process_raw(
+                        imu_ts, gyro, accel, mag)
 
-                result = processor.process_raw(imu_ts, gyro, accel, mag)
+                    if result is not None:
+                        logger.write_row(
+                            wall_time=time.time(),
+                            imu_ts_us=result["imu_ts_us"],
+                            dt=result["dt"],
+                            gyro=result["gyro"],
+                            accel_g=result["accel_g"],
+                            gravity_g=result["gravity_g"],
+                            linear_g=result["linear_g"],
+                            mag=result["mag"],
+                            quat_wxyz=result["quat_wxyz"],
+                            euler_deg=result["euler_deg"],
+                            vel_enu=result["vel_enu"])
 
-                if result is not None:
-                    logger.write_row(
-                        wall_time=time.time(),
-                        imu_ts_us=result["imu_ts_us"],
-                        dt=result["dt"],
-                        gyro=result["gyro"],
-                        accel_g=result["accel_g"],
-                        gravity_g=result["gravity_g"],
-                        linear_g=result["linear_g"],
-                        mag=result["mag"],
-                        quat_wxyz=result["quat_wxyz"],
-                        euler_deg=result["euler_deg"],
-                        vel_enu=result["vel_enu"],
-                    )
-
-            # ── Periodic display ──
             now = time.time()
-            if now - last_print_time >= print_interval:
+            if now - last_print_time >= PRINT_EVERY:
                 last_print_time = now
-
-                print("─" * 72)
-
-                # Gyro
-                if processor.raw_count > 0:
-                    r = processor
-                    # Use latest result if available
+                r = processor
+                if r.latest_raw is not None:
+                    raw = r.latest_raw
                     vel = r.vel_enu
-                    speed_h = math.sqrt(vel[0] ** 2 + vel[1] ** 2)
-                    euler = r.euler_deg
+                    speed_h = math.sqrt(
+                        vel[0] ** 2 + vel[1] ** 2)
+                    accel_norm = np.linalg.norm(
+                        raw["accel_g"])
+                    gravity_norm = np.linalg.norm(
+                        r.gravity_g)
+                    linear_norm = np.linalg.norm(
+                        raw["linear_g"])
 
-                    print(
-                        f"[IMU-ONLY] "
-                        f"raw={r.raw_count} "
-                        f"grav={r.gravity_count} "
-                        f"quat={r.quat_count}"
-                    )
-                    print(
-                        f"  Euler: yaw={euler[0]:.1f}° "
-                        f"pitch={euler[1]:.1f}° "
-                        f"roll={euler[2]:.1f}°"
-                    )
-                    print(
-                        f"  Gravity (g): "
-                        f"{format_vec(r.gravity_g, 4)}"
-                    )
-                    print(
-                        f"  Vel ENU (m/s): "
-                        f"E={vel[0]:.3f} N={vel[1]:.3f} "
-                        f"U={vel[2]:.3f} | "
-                        f"speed={speed_h:.3f}"
-                    )
+                    print("=" * 72)
+                    print(f"RAW ts: {raw['imu_ts_us']}")
+                    print(f"  Gyro  rad/s: "
+                          f"{format_vec(raw['gyro'], 6)}")
+                    print(f"  Accel g:     "
+                          f"{format_vec(raw['accel_g'], 6)}"
+                          f"  norm={accel_norm:.6f}")
+                    print(f"  Gravity g:   "
+                          f"{format_vec(r.gravity_g, 6)}"
+                          f"  norm={gravity_norm:.6f}")
+                    print(f"  Linear g:    "
+                          f"{format_vec(raw['linear_g'], 6)}"
+                          f"  norm={linear_norm:.6f}")
+                    print(f"  Mag:         "
+                          f"{format_vec(raw['mag'], 4)}")
+                    print(f"  Euler: "
+                          f"yaw={r.euler_deg[0]:.2f}° "
+                          f"pitch={r.euler_deg[1]:.2f}° "
+                          f"roll={r.euler_deg[2]:.2f}°")
+                    print(f"  Vel ENU m/s: "
+                          f"E={vel[0]:.4f} "
+                          f"N={vel[1]:.4f} "
+                          f"U={vel[2]:.4f} | "
+                          f"speed={speed_h:.4f}")
 
-                # Rate report
+                    if r.latest_rpy is not None:
+                        rpy = r.latest_rpy
+                        print(f"  RPY official: "
+                              f"roll={rpy['roll']:.2f}° "
+                              f"pitch={rpy['pitch']:.2f}° "
+                              f"yaw={rpy['yaw']:.2f}°")
+
                 if now - last_rate_time >= 2.0:
                     elapsed = now - rate_start_time
                     if elapsed > 0:
                         print(
-                            f"  Rate: "
-                            f"RAW={processor.raw_count / elapsed:.0f} Hz | "
-                            f"GRAV={processor.gravity_count / elapsed:.0f} Hz | "
-                            f"QUAT={processor.quat_count / elapsed:.0f} Hz | "
-                            f"CRC_fail={imu_reader.crc_fail_count} | "
-                            f"Logged={logger._count} rows"
-                        )
+                            f"  RATE: "
+                            f"RAW="
+                            f"{r.raw_count / elapsed:.0f} Hz"
+                            f" | GRAV="
+                            f"{r.gravity_count / elapsed:.0f}"
+                            f" Hz | QUAT="
+                            f"{r.quat_count / elapsed:.0f}"
+                            f" Hz | RPY="
+                            f"{r.rpy_count / elapsed:.0f}"
+                            f" Hz | CRC_fail="
+                            f"{imu_reader.crc_fail_count}"
+                            f" | Logged={logger._count}")
                     last_rate_time = now
+
+            if not got_data:
+                time.sleep(0.0002)
 
     except KeyboardInterrupt:
         print("\nStopping IMU-only mode...")
@@ -1865,78 +1865,101 @@ def run_imu_only(imu_reader):
 
 
 # ─────────────────────────────────────────────
-# EKF FUSION MAIN LOOP
+# EKF FUSION MAIN LOOP (threaded readers)
 # ─────────────────────────────────────────────
 
-def run_ekf_fusion(imu_reader, gps_ser):
-    """
-    Full GPS+IMU EKF fusion mode.
-    Also handles GPS-only (imu_reader=None) and
-    IMU+GPS where GPS arrives late.
-    """
+def run_ekf_fusion(imu_reader, imu_ser, gps_ser):
     ekf = SensorFusionEKF()
     pos_logger = PositionLogger("position.csv")
 
     last_gps_error = None
     last_heading_deg = None
-    last_valid_raw_gps = None
 
-    # ── Phase 1: Wait for GPS fix ──
+    # ── Shared queue and stop event ──
+    sensor_queue = queue.Queue(
+        maxsize=SENSOR_QUEUE_MAXSIZE)
+    stop_event = threading.Event()
+
+    imu_thread = None
+    gps_thread = None
+
+    # ── Phase 1: Wait for GPS fix (single-threaded) ──
+    # Before starting threads, do the GPS wait phase
+    # so we have a reference position for ENU conversion.
     if gps_ser is not None:
         print(f"Waiting for GPS fix ({GPS_FIX_TIMEOUT_S}s)...")
         start_time = time.time()
+        last_valid_raw_gps = None
 
         try:
             while (ekf.reference_gps is None
-                   and time.time() - start_time < GPS_FIX_TIMEOUT_S):
+                   and time.time() - start_time
+                   < GPS_FIX_TIMEOUT_S):
 
-                gps_fix = read_gps_line(
-                    gps_ser, last_valid_raw_gps=last_valid_raw_gps)
+                # Read GPS
+                try:
+                    raw_bytes = gps_ser.readline()
+                    if raw_bytes:
+                        line = raw_bytes.decode(
+                            "ascii",
+                            errors="strict").strip()
+                        gps_fix = parse_gps_line(
+                            line,
+                            last_valid_raw_gps=(
+                                last_valid_raw_gps))
 
-                if not gps_fix:
-                    if imu_reader is not None:
-                        for _ in range(50):
-                            ts, data = imu_reader.read_packet()
-                            if data is None:
-                                break
-                            if data.get("packet_type") == "QUAT":
-                                q = np.array([
-                                    data["q2"], data["q3"],
-                                    data["q4"], data["q1"],
-                                ], dtype=float)
-                                ekf.update_orientation_from_quat(q)
-                    time.sleep(0.001)
-                    continue
+                        if gps_fix is not None:
+                            mt = gps_fix.get("type")
 
-                if gps_fix.get("type") == "GST":
-                    last_gps_error = (
-                        gps_fix.get("lat_err"),
-                        gps_fix.get("lon_err"),
-                        gps_fix.get("alt_err"),
-                    )
-                elif gps_fix.get("type") == "HDT":
-                    last_heading_deg = gps_fix.get("heading_deg")
-                elif gps_fix.get("type") == "RMC":
-                    if gps_fix.get("valid"):
-                        ekf.gps_vel_tracker.feed_rmc_vtg(
-                            gps_fix.get("speed_mps"),
-                            gps_fix.get("course_deg"),
-                        )
-                elif gps_fix.get("type") == "VTG":
-                    ekf.gps_vel_tracker.feed_rmc_vtg(
-                        gps_fix.get("speed_mps"),
-                        gps_fix.get("course_deg"),
-                    )
-                elif (gps_fix.get("type") == "GGA"
-                      and gps_fix.get("valid")):
-                    lat = gps_fix["lat"]
-                    lon = gps_fix["lon"]
-                    alt = gps_fix.get("alt")
-                    last_valid_raw_gps = gps_fix.copy()
+                            if mt == "RMC":
+                                if gps_fix.get("valid"):
+                                    ekf.gps_vel_tracker.feed_rmc_vtg(gps_fix.get("speed_mps"), gps_fix.get("course_deg"))
+                                      
 
-                    if lat and lon and lat != 0.0 and lon != 0.0:
-                        ekf.set_reference_gps(lat, lon, alt)
-                        print(f"Reference GPS set: {ekf.reference_gps}")
+                            elif mt == "VTG":
+                                ekf.gps_vel_tracker.feed_rmc_vtg(
+                                    gps_fix.get(
+                                        "speed_mps"),
+                                    gps_fix.get(
+                                        "course_deg"))
+
+                            elif (mt == "GGA"
+                                  and gps_fix.get("valid")):
+                                last_valid_raw_gps = (
+                                    gps_fix.copy())
+                                lat = gps_fix["lat"]
+                                lon = gps_fix["lon"]
+                                alt = gps_fix.get("alt")
+
+                                if (lat and lon
+                                        and lat != 0.0
+                                        and lon != 0.0):
+                                    ekf.set_reference_gps(
+                                        lat, lon, alt)
+                                    print(
+                                        f"Reference GPS set:"
+                                        f" {ekf.reference_gps}"
+                                    )
+                except Exception:
+                    pass
+
+                # Drain IMU during wait
+                if imu_reader is not None:
+                    for _ in range(50):
+                        ts, data = (
+                            imu_reader.read_packet())
+                        if data is None:
+                            break
+                        if data.get(
+                                "packet_type") == "QUAT":
+                            q = np.array([
+                                data["q2"], data["q3"],
+                                data["q4"], data["q1"]],
+                                dtype=float)
+                            ekf.update_orientation_from_quat(
+                                q)
+
+                time.sleep(0.001)
 
         except KeyboardInterrupt:
             print("\nStopped during GPS wait.")
@@ -1952,248 +1975,329 @@ def run_ekf_fusion(imu_reader, gps_ser):
         print("IMU disabled. GPS-only mode.")
 
     print(f"Mode: {ekf.get_mode_string()}")
-    print("Starting fusion loop...")
+    print("Starting threaded fusion loop...")
 
-    # ── Phase 2: Main fusion loop ──
-    imu_packets_read = 0
-    imu_predictions_done = 0
-    gps_lines_read = 0
-    gps_vel_updates = 0
-    loop_counter = 0
-    rate_window_start = time.time()
-    last_predict_print_time = 0.0
+    # ── Start reader threads ──
+    if imu_reader is not None:
+        imu_thread = IMUReaderThread(
+            imu_reader, sensor_queue, stop_event)
+        imu_thread.start()
+        print("[THREAD] IMU reader started")
+
+    if gps_ser is not None:
+        gps_thread = GPSReaderThread(
+            gps_ser, sensor_queue, stop_event)
+        gps_thread.start()
+        print("[THREAD] GPS reader started")
+
+    # ── Phase 2: Main processing loop ──
+    # Dequeue items in arrival order and process.
+    # Items arrive naturally interleaved by wall clock:
+    #   imu, imu,..., imu, gps, imu, imu,..., imu, gps
+    # because IMU thread produces ~40x faster than GPS.
+
+    imu_predictions_total = 0
+    gps_updates_total = 0
+    gps_vel_total = 0
+
+    rate_start_time = time.time()
+    last_print_time = time.time()
+    last_rate_time = time.time()
+    last_gps_print_info = None
 
     try:
         while True:
-            loop_counter += 1
+            # ── Get next sensor item ──
+            try:
+                wall_time, source, data = (
+                    sensor_queue.get(timeout=0.01))
+            except queue.Empty:
+                # Nothing available — check print timer
+                now = time.time()
+                if now - last_print_time >= PRINT_EVERY:
+                    last_print_time = now
+                    _print_ekf_status(
+                        ekf, last_gps_print_info,
+                        imu_thread, gps_thread,
+                        imu_predictions_total,
+                        gps_updates_total,
+                        gps_vel_total,
+                        rate_start_time, last_rate_time,
+                        pos_logger)
+                    last_gps_print_info = None
+                    if now - last_rate_time >= 2.0:
+                        last_rate_time = now
 
-            # ── Drain IMU packets ──
-            imu_batch_count = 0
-            if imu_reader is not None:
-                while True:
-                    imu_timestamp, imu_data = imu_reader.read_packet()
-                    if imu_data is None:
-                        break
+                # GPS timeout inflation
+                gps_age = ekf.gps_age_seconds()
+                if (gps_age is not None
+                        and gps_age > 5.0):
+                    inflate = min(gps_age * 0.5, 50.0)
+                    ekf.P[0:3, 0:3] += (
+                        np.eye(3) * inflate * ekf.dt)
+                continue
 
-                    imu_packets_read += 1
-                    imu_batch_count += 1
+            # ── Process IMU ──
+            if source == "imu":
+                imu_ts, imu_data = data
+                pt = imu_data.get("packet_type")
 
-                    if imu_data.get("packet_type") == "RAW":
-                        gyro = np.array([
-                            imu_data["gyro_x_rad_s"],
-                            imu_data["gyro_y_rad_s"],
-                            imu_data["gyro_z_rad_s"],
-                        ], dtype=float)
+                if pt == "RAW":
+                    gyro = np.array([
+                        imu_data["gyro_x_rad_s"],
+                        imu_data["gyro_y_rad_s"],
+                        imu_data["gyro_z_rad_s"]],
+                        dtype=float)
+                    accel = np.array([
+                        imu_data["accel_x_g"],
+                        imu_data["accel_y_g"],
+                        imu_data["accel_z_g"]],
+                        dtype=float)
 
-                        accel = np.array([
-                            imu_data["accel_x_g"],
-                            imu_data["accel_y_g"],
-                            imu_data["accel_z_g"],
-                        ], dtype=float)
+                    predicted = ekf.update_imu(
+                        gyro, accel, imu_ts)
 
-                        predicted = ekf.update_imu(
-                            gyro, accel, imu_timestamp)
+                    if predicted:
+                        imu_predictions_total += 1
+                        pos_logger.log_ekf(ekf)
 
-                        if predicted:
-                            imu_predictions_done += 1
-                            pos_logger.log_ekf(ekf)
+                elif pt == "QUAT":
+                    q = np.array([
+                        imu_data["q2"], imu_data["q3"],
+                        imu_data["q4"], imu_data["q1"]],
+                        dtype=float)
+                    ekf.update_orientation_from_quat(q)
 
-                            now = time.time()
-                            if now - last_predict_print_time > 0.25:
-                                pos_local = ekf.get_position_local()
-                                vel = ekf.get_velocity()
-                                yaw_display = ekf.get_yaw_deg()
+            # ── Process GPS ──
+            elif source == "gps":
+                gps_fix = data
+                msg_type = gps_fix.get("type")
 
-                                gps_pos = ekf.get_gps_position()
-                                if gps_pos is not None:
-                                    print(
-                                        f"[IMU] "
-                                        f"lat={gps_pos[0]:.8f} "
-                                        f"lon={gps_pos[1]:.8f} "
-                                        f"alt={gps_pos[2]:.2f} "
-                                        f"yaw={yaw_display:.1f} | "
-                                        f"local=("
-                                        f"{pos_local[0]:.2f},"
-                                        f"{pos_local[1]:.2f},"
-                                        f"{pos_local[2]:.2f}) "
-                                        f"vel=("
-                                        f"{vel[0]:.2f},"
-                                        f"{vel[1]:.2f},"
-                                        f"{vel[2]:.2f})"
-                                    )
-                                else:
-                                    euler = ekf.get_euler_deg()
-                                    print(
-                                        f"[IMU-EKF] "
-                                        f"pos=("
-                                        f"{pos_local[0]:.3f},"
-                                        f"{pos_local[1]:.3f},"
-                                        f"{pos_local[2]:.3f}) m | "
-                                        f"vel=("
-                                        f"{vel[0]:.3f},"
-                                        f"{vel[1]:.3f},"
-                                        f"{vel[2]:.3f}) m/s | "
-                                        f"yaw={yaw_display:.1f} "
-                                        f"pitch={euler[1]:.1f} "
-                                        f"roll={euler[2]:.1f}"
-                                    )
-                                last_predict_print_time = now
+                if msg_type == "GGA":
+                    if gps_fix.get("valid"):
+                        lat = gps_fix["lat"]
+                        lon = gps_fix["lon"]
+                        alt = gps_fix.get("alt")
 
-                    elif imu_data.get("packet_type") == "QUAT":
-                        q = np.array([
-                            imu_data["q2"], imu_data["q3"],
-                            imu_data["q4"], imu_data["q1"],
-                        ], dtype=float)
-                        ekf.update_orientation_from_quat(q)
+                        pos_logger.log_gps(gps_fix)
 
-                    if imu_batch_count > 100:
-                        break
+                        if ekf.reference_gps is None:
+                            if (lat and lon
+                                    and lat != 0.0
+                                    and lon != 0.0):
+                                ekf.set_reference_gps(
+                                    lat, lon, alt)
+                                print(
+                                    f"[LATE GPS INIT] "
+                                    f"Ref: "
+                                    f"{ekf.reference_gps}")
 
-            # ── Read ALL available GPS lines ──
-            if gps_ser is not None:
-                gps_batch = 0
-                while gps_batch < 50:
-                    gps_fix = read_gps_line(
-                        gps_ser,
-                        last_valid_raw_gps=last_valid_raw_gps,
-                    )
+                        if ekf.reference_gps is not None:
+                            gps_updated = ekf.update_gps(
+                                lat, lon, alt,
+                                hdop=gps_fix.get("hdop"))
 
-                    if gps_fix is None:
-                        break
+                            if gps_updated:
+                                gps_updates_total += 1
+                                last_gps_print_info = {
+                                    "gps_pos":
+                                        ekf.get_gps_position(),
+                                    "vel":
+                                        ekf.get_velocity(),
+                                    "yaw":
+                                        ekf.get_yaw_deg(),
+                                    "update_info":
+                                        ekf.latest_gps_update_info,
+                                }
 
-                    gps_batch += 1
-                    gps_lines_read += 1
-                    msg_type = gps_fix.get("type")
-
-                    if msg_type == "GGA":
-                        if gps_fix.get("valid"):
-                            last_valid_raw_gps = gps_fix.copy()
-                            lat = gps_fix["lat"]
-                            lon = gps_fix["lon"]
-                            alt = gps_fix.get("alt")
-
-                            pos_logger.log_gps(gps_fix)
-
-                            if ekf.reference_gps is None:
-                                if (lat and lon
-                                        and lat != 0.0
-                                        and lon != 0.0):
-                                    ekf.set_reference_gps(
-                                        lat, lon, alt)
-                                    print(
-                                        f"[LATE GPS INIT] "
-                                        f"Ref: {ekf.reference_gps}"
-                                    )
-
-                            if ekf.reference_gps is not None:
-                                gps_updated = ekf.update_gps(
-                                    lat, lon, alt,
-                                    hdop=gps_fix.get("hdop"),
-                                )
-                                if gps_updated:
-                                    gps_pos = ekf.get_gps_position()
-                                    vel = ekf.get_velocity()
-                                    if gps_pos is not None:
-                                        print(
-                                            f"[GPS UPDATE] "
-                                            f"lat={gps_pos[0]:.8f} "
-                                            f"lon={gps_pos[1]:.8f} "
-                                            f"alt={gps_pos[2]:.2f} "
-                                            f"yaw="
-                                            f"{ekf.get_yaw_deg():.1f} "
-                                            f"vel=("
-                                            f"{vel[0]:.2f},"
-                                            f"{vel[1]:.2f},"
-                                            f"{vel[2]:.2f})"
-                                        )
-
-                    elif msg_type == "RMC":
-                        if gps_fix.get("valid"):
-                            ekf.gps_vel_tracker.feed_rmc_vtg(
-                                gps_fix.get("speed_mps"),
-                                gps_fix.get("course_deg"),
-                            )
-                            gps_vel_updates += 1
-
-                    elif msg_type == "VTG":
+                elif msg_type == "RMC":
+                    if gps_fix.get("valid"):
                         ekf.gps_vel_tracker.feed_rmc_vtg(
                             gps_fix.get("speed_mps"),
-                            gps_fix.get("course_deg"),
-                        )
-                        gps_vel_updates += 1
+                            gps_fix.get("course_deg"))
+                        gps_vel_total += 1
 
-                    elif msg_type == "GST":
-                        last_gps_error = (
-                            gps_fix.get("lat_err"),
-                            gps_fix.get("lon_err"),
-                            gps_fix.get("alt_err"),
-                        )
+                elif msg_type == "VTG":
+                    ekf.gps_vel_tracker.feed_rmc_vtg(
+                        gps_fix.get("speed_mps"),
+                        gps_fix.get("course_deg"))
+                    gps_vel_total += 1
 
-                    elif msg_type == "HDT":
-                        last_heading_deg = gps_fix.get("heading_deg")
-                        if last_heading_deg is not None:
-                            ekf.update_heading(
-                                last_heading_deg,
-                                heading_sigma_deg=(
-                                    DEFAULT_HEADING_SIGMA_DEG),
-                            )
+                elif msg_type == "GST":
+                    last_gps_error = (
+                        gps_fix.get("lat_err"),
+                        gps_fix.get("lon_err"),
+                        gps_fix.get("alt_err"))
 
-            # ── GPS timeout covariance inflation ──
+                elif msg_type == "HDT":
+                    last_heading_deg = gps_fix.get(
+                        "heading_deg")
+                    if last_heading_deg is not None:
+                        ekf.update_heading(
+                            last_heading_deg,
+                            heading_sigma_deg=(
+                                DEFAULT_HEADING_SIGMA_DEG))
+
+            # ── GPS timeout inflation ──
             gps_age = ekf.gps_age_seconds()
             if gps_age is not None and gps_age > 5.0:
                 inflate = min(gps_age * 0.5, 50.0)
-                ekf.P[0:3, 0:3] += np.eye(3) * inflate * ekf.dt
+                ekf.P[0:3, 0:3] += (
+                    np.eye(3) * inflate * ekf.dt)
 
-            # ── Rate reporting ──
+            # ── Periodic display ──
             now = time.time()
-            if now - rate_window_start >= 2.0:
-                elapsed = now - rate_window_start
-                mode = ekf.get_mode_string()
-                parts = [f"[RATE] mode={mode}"]
-
-                if imu_reader is not None:
-                    parts.append(
-                        f"imu={imu_packets_read / elapsed:.0f}/s")
-                    parts.append(
-                        f"pred={imu_predictions_done / elapsed:.0f}/s")
-                    parts.append(
-                        f"skip={ekf.skipped_predicts}")
-                    parts.append(f"dt={ekf.dt:.6f}")
-                    parts.append(
-                        f"crc_fail={imu_reader.crc_fail_count}")
-
-                if gps_ser is not None:
-                    parts.append(
-                        f"gps={gps_lines_read / elapsed:.0f}/s")
-                    parts.append(
-                        f"vel_feed={gps_vel_updates / elapsed:.0f}/s")
-
-                parts.append(
-                    f"loops={loop_counter / elapsed:.0f}/s")
-
-                print(" | ".join(parts))
-
-                loop_counter = 0
-                imu_packets_read = 0
-                imu_predictions_done = 0
-                gps_lines_read = 0
-                gps_vel_updates = 0
-                rate_window_start = now
-
-            if imu_batch_count == 0:
-                if imu_reader is not None:
-                    time.sleep(0.0002)
-                else:
-                    time.sleep(0.01)
+            if now - last_print_time >= PRINT_EVERY:
+                last_print_time = now
+                _print_ekf_status(
+                    ekf, last_gps_print_info,
+                    imu_thread, gps_thread,
+                    imu_predictions_total,
+                    gps_updates_total,
+                    gps_vel_total,
+                    rate_start_time, last_rate_time,
+                    pos_logger)
+                last_gps_print_info = None
+                if now - last_rate_time >= 2.0:
+                    last_rate_time = now
 
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
+        stop_event.set()
+
+        if imu_thread is not None:
+            imu_thread.join(timeout=1.0)
+            print(f"[THREAD] IMU: "
+                  f"{imu_thread.packets_read} packets, "
+                  f"{imu_thread.queue_full_drops} drops")
+
+        if gps_thread is not None:
+            gps_thread.join(timeout=1.0)
+            print(f"[THREAD] GPS: "
+                  f"{gps_thread.lines_read} lines, "
+                  f"{gps_thread.queue_full_drops} drops")
+
         pos_logger.close()
         print(f"Closed. Mode: {ekf.get_mode_string()}")
         if imu_reader is not None:
-            print(f"CRC failures: {imu_reader.crc_fail_count}")
-            print(f"Bad packets: {imu_reader.bad_packet_count}")
+            print(f"CRC failures: "
+                  f"{imu_reader.crc_fail_count}")
+            print(f"Bad packets: "
+                  f"{imu_reader.bad_packet_count}")
+
+
+def _print_ekf_status(ekf, last_gps_print_info,
+                      imu_thread, gps_thread,
+                      imu_predictions_total,
+                      gps_updates_total,
+                      gps_vel_total,
+                      rate_start_time, last_rate_time,
+                      pos_logger):
+    """Print EKF status — called on timer from main loop."""
+    now = time.time()
+    print("=" * 72)
+
+    # GPS update info
+    if last_gps_print_info is not None:
+        info = last_gps_print_info
+        gps_pos = info["gps_pos"]
+        ui = info.get("update_info")
+
+        if gps_pos is not None:
+            line = (
+                f"[GPS] lat={gps_pos[0]:.8f} "
+                f"lon={gps_pos[1]:.8f} "
+                f"alt={gps_pos[2]:.2f} "
+                f"yaw={info['yaw']:.1f}°")
+            if ui and ui.get("vel_source"):
+                vs = ui["vel_source"]
+                vm = ui["vel_meas"]
+                line += (
+                    f" | vel_{vs}=("
+                    f"{vm[0]:.2f},{vm[1]:.2f},"
+                    f"{vm[2]:.2f})")
+            print(line)
+
+    # EKF state
+    if ekf.latest_pos_local is not None:
+        pos = ekf.latest_pos_local
+        vel = ekf.latest_vel
+        yaw = ekf.latest_yaw_deg
+        gps_pos = ekf.latest_gps_pos
+
+        if gps_pos is not None:
+            print(
+                f"[EKF] lat={gps_pos[0]:.8f} "
+                f"lon={gps_pos[1]:.8f} "
+                f"alt={gps_pos[2]:.2f} "
+                f"yaw={yaw:.1f}° | "
+                f"local=({pos[0]:.2f},{pos[1]:.2f},"
+                f"{pos[2]:.2f}) "
+                f"vel=({vel[0]:.2f},{vel[1]:.2f},"
+                f"{vel[2]:.2f})")
+        else:
+            euler = ekf.latest_euler_deg
+            print(
+                f"[EKF] pos=({pos[0]:.3f},"
+                f"{pos[1]:.3f},{pos[2]:.3f}) m | "
+                f"vel=({vel[0]:.3f},{vel[1]:.3f},"
+                f"{vel[2]:.3f}) m/s | "
+                f"yaw={yaw:.1f}° "
+                f"pitch={euler[1]:.1f}° "
+                f"roll={euler[2]:.1f}°")
+
+    # Rate
+    if now - last_rate_time >= 2.0:
+        elapsed = now - rate_start_time
+        mode = ekf.get_mode_string()
+        parts = [f"RATE mode={mode}"]
+
+        if imu_thread is not None:
+            parts.append(
+                f"imu_read="
+                f"{imu_thread.packets_read / elapsed:.0f}"
+                f"/s")
+            parts.append(
+                f"pred="
+                f"{imu_predictions_total / elapsed:.0f}"
+                f"/s")
+            parts.append(
+                f"skip={ekf.skipped_predicts}")
+            parts.append(f"dt={ekf.dt:.6f}")
+            parts.append(
+                f"crc={imu_thread.imu_reader.crc_fail_count}")
+            if imu_thread.queue_full_drops > 0:
+                parts.append(
+                    f"imu_drops="
+                    f"{imu_thread.queue_full_drops}")
+
+        if gps_thread is not None:
+            parts.append(
+                f"gps_read="
+                f"{gps_thread.lines_read / elapsed:.0f}"
+                f"/s")
+            parts.append(
+                f"gps_upd="
+                f"{gps_updates_total / elapsed:.0f}"
+                f"/s")
+            parts.append(
+                f"vel_feed="
+                f"{gps_vel_total / elapsed:.0f}/s")
+            if gps_thread.queue_full_drops > 0:
+                parts.append(
+                    f"gps_drops="
+                    f"{gps_thread.queue_full_drops}")
+
+        qsize = 0
+        try:
+            qsize = imu_thread.queue.qsize() if imu_thread else 0
+        except Exception:
+            pass
+        parts.append(f"q={qsize}")
+        parts.append(f"logged={pos_logger._count}")
+
+        print("  " + " | ".join(parts))
 
 
 # ─────────────────────────────────────────────
@@ -2205,67 +2309,63 @@ def main():
     gps_ser = None
     imu_reader = None
 
-    # ── Open IMU ──
     if IMU_ENABLED:
         try:
-            imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0)
+            imu_ser = serial.Serial(
+                IMU_PORT, IMU_BAUD, timeout=0)
             imu_reader = IMUPacketReader(
                 imu_ser,
-                check_crc=not _args.skip_crc,
-            )
+                check_crc=not _args.skip_crc)
             print(f"Opened IMU: {IMU_PORT} @ {IMU_BAUD}")
             if not validate_imu_connection(imu_reader):
-                print("[WARNING] IMU not responding. Disabling.")
+                print("[WARNING] IMU not responding.")
                 imu_ser.close()
                 imu_ser = None
                 imu_reader = None
         except serial.SerialException as exc:
             print(f"[WARNING] Could not open IMU: {exc}")
 
-    # ── Open GPS ──
     if GPS_ENABLED:
         try:
-            gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.01)
+            gps_ser = serial.Serial(
+                GPS_PORT, GPS_BAUD, timeout=0.1)
             print(f"Opened GPS: {GPS_PORT} @ {GPS_BAUD}")
             if not validate_gps_connection(gps_ser):
-                print("[WARNING] GPS not responding. Disabling.")
+                print("[WARNING] GPS not responding.")
                 gps_ser.close()
                 gps_ser = None
         except serial.SerialException as exc:
             print(f"[WARNING] Could not open GPS: {exc}")
 
-    # ── No sensors at all ──
     if imu_ser is None and gps_ser is None:
         print("[ERROR] No sensors available. Exiting.")
         return
 
     # ── Route to correct mode ──
     if imu_reader is not None and gps_ser is None:
-        # IMU only — no EKF, raw data logging
         print("=" * 60)
-        print("MODE: IMU-ONLY (no GPS available)")
-        print("  No EKF will be used.")
-        print("  Raw sensor data + velocity → IMU_only.csv")
+        print("MODE: IMU-ONLY (no GPS)")
+        print("  No EKF. Raw data → IMU_only.csv")
         print("=" * 60)
         try:
             run_imu_only(imu_reader)
         finally:
             imu_ser.close()
-            print("IMU serial closed.")
-            print(f"CRC failures: {imu_reader.crc_fail_count}")
-            print(f"Bad packets: {imu_reader.bad_packet_count}")
+            print(f"CRC failures: "
+                  f"{imu_reader.crc_fail_count}")
+            print(f"Bad packets: "
+                  f"{imu_reader.bad_packet_count}")
 
     else:
-        # GPS available (with or without IMU) — use EKF
         print("=" * 60)
         if imu_reader is not None:
-            print("MODE: GPS+IMU EKF FUSION")
+            print("MODE: GPS+IMU EKF FUSION (threaded)")
         else:
             print("MODE: GPS-ONLY (no IMU)")
         print("  EKF active → position.csv")
         print("=" * 60)
         try:
-            run_ekf_fusion(imu_reader, gps_ser)
+            run_ekf_fusion(imu_reader, imu_ser, gps_ser)
         finally:
             if imu_ser is not None:
                 imu_ser.close()
