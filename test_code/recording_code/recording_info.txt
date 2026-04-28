@@ -1,0 +1,83 @@
+Recording Session Info
+======================
+Start time:     2026-04-28 14:46:38
+Start epoch:    1777401998.841636
+OS:             Windows
+IMU port:       COM12
+IMU baud:       115200
+GPS port:       COM5
+GPS baud:       115200
+IMU enabled:    True
+GPS enabled:    True
+Duration:       unlimited
+Output dir:     d:\ryan\github\paper\pavement_scanning_cam_array\pavement_scanning_cam_array\test_code\recording_code
+Serial buffer:  65536 bytes
+Event queue:    100000 slots (blocking put)
+
+Time synchronization:
+  wall_time:        PC perf_counter anchored to time.time()
+  imu_timestamp_us: IMU hardware clock (microseconds, wraps at 2^32)
+  gps_utc:          UTC from NMEA sentences (epoch or time-of-day)
+  gps_utc_type:     'epoch' = full datetime, 'tod' = seconds since midnight
+  Alignment method: use wall_time to correlate IMU and GPS clocks offline
+
+IMU: SYD Dynamics TransducerM TM151
+  Protocol: EasyProfile binary with CRC-16/MODBUS
+  Rate: 400 Hz
+  RAW packet (cmd 41):
+    Field order: timestamp, gyroX, gyroY, gyroZ, accX, accY, accZ, [magX, magY, magZ]
+    Gyro unit: rad/s
+    Accel unit: g (INCLUDES GRAVITY)
+  QUAT packet (cmd 32): [q1(w), q2(x), q3(y), q4(z)]
+  RPY packet (cmd 35): [roll, pitch, yaw] degrees
+  GRAVITY packet (cmd 36): [gx, gy, gz] in g (body frame)
+
+GPS: Septentrio (NMEA output)
+  Sentences: GGA, GST, HDT, RMC, VTG
+  Rate: ~10 Hz
+  RTK corrections: enabled
+
+Output files:
+  imu_raw.csv:     RAW packets (gyro + accel + mag)
+  imu_quat.csv:    QUAT packets (AHRS quaternion)
+  imu_rpy.csv:     RPY packets (AHRS euler angles)
+  imu_gravity.csv: GRAVITY packets (gravity vector body frame)
+  gps_raw.csv:     All NMEA sentences with parsed fields + raw string
+
+Recording Complete
+==================
+End time:       2026-04-28 14:46:49
+Duration:       10.8 seconds
+
+IMU CRC:
+  CRC pass:     0
+  CRC fail:     0
+
+IMU RAW Logger:
+  Rows written: 0
+  Rows dropped: 0
+  Rate:         0.0 rows/s
+
+IMU QUAT Logger:
+  Rows written: 0
+  Rows dropped: 0
+
+IMU RPY Logger:
+  Rows written: 0
+  Rows dropped: 0
+
+IMU GRAVITY Logger:
+  Rows written: 0
+  Rows dropped: 0
+
+GPS Logger:
+  Rows written: 362
+  Rows dropped: 0
+  Rate:         33.4 rows/s
+
+GPS Reader Thread:
+  Lines read:     363
+  Lines queued:   363
+  Lines lost:     0
+
+★ RECORDING COMPLETE — ZERO DROPS, ZERO CRC ERRORS ★
