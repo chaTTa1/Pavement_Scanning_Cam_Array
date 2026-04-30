@@ -50,7 +50,7 @@ DEFAULT_DATA_DIR = SCRIPT_DIR / "second_data"
 DEFAULT_OUTPUT_DIR = DEFAULT_DATA_DIR / "factor_graph_output"
 
 AUTO_CONVERT_PPC = False
-FACTOR_GRAPH_DURATION_S = None    # use None for full run
+FACTOR_GRAPH_DURATION_S = 300    # use None for full run
 KEYFRAME_STRIDE = 1                # 1 = every GPS position, 5 = every 5th
 
 GRAVITY_MPS2 = 9.80665
