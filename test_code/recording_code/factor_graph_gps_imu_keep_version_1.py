@@ -724,228 +724,6 @@ def unwrap_heading_deg(values):
     return out
 
 
-def _safe_window_title(fig, title: str):
-    try:
-        if fig.canvas.manager is not None:
-            fig.canvas.manager.set_window_title(title)
-    except AttributeError:
-        pass
-
-
-def _pearson_corr(a, b):
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    valid = np.isfinite(a) & np.isfinite(b)
-    if np.count_nonzero(valid) < 5:
-        return np.nan
-    a = a[valid] - np.mean(a[valid])
-    b = b[valid] - np.mean(b[valid])
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
-    if denom < 1e-12:
-        return np.nan
-    return float(np.dot(a, b) / denom)
-
-
-def _heading_from_quat_df(imu_quat):
-    q_wxyz = imu_quat[["q1", "q2", "q3", "q4"]].values.astype(float)
-    valid = np.isfinite(q_wxyz).all(axis=1)
-    q_xyzw = q_wxyz[:, [1, 2, 3, 0]]
-    q_norm = np.linalg.norm(q_xyzw, axis=1)
-    valid &= q_norm > 1e-12
-    headings = np.full(len(imu_quat), np.nan, dtype=float)
-    if np.any(valid):
-        forward = Rot.from_quat(q_xyzw[valid] / q_norm[valid, None]).apply(
-            np.array([1.0, 0.0, 0.0])
-        )
-        headings[valid] = np.degrees(np.arctan2(forward[:, 0], forward[:, 1])) % 360.0
-    return headings
-
-
-def plot_sync_diagnostics(data_dir, output_dir):
-    gps_path = Path(data_dir) / "gps_raw.csv"
-    quat_path = Path(data_dir) / "imu_quat.csv"
-    if not gps_path.exists() or not quat_path.exists():
-        print("[INFO] Skip sync diagnostics: gps_raw.csv or imu_quat.csv missing.")
-        return
-
-    gps_raw = pd.read_csv(gps_path)
-    imu_quat = pd.read_csv(quat_path)
-    for col in ["wall_time", "heading_deg"]:
-        if col in gps_raw.columns:
-            gps_raw[col] = pd.to_numeric(gps_raw[col], errors="coerce")
-    for col in ["wall_time", "q1", "q2", "q3", "q4"]:
-        imu_quat[col] = pd.to_numeric(imu_quat[col], errors="coerce")
-
-    gps_hdt = gps_raw[gps_raw["msg_type"] == "HDT"].dropna(
-        subset=["wall_time", "heading_deg"]
-    )
-    imu_quat = imu_quat.dropna(subset=["wall_time", "q1", "q2", "q3", "q4"])
-    if len(gps_hdt) < 10 or len(imu_quat) < 10:
-        print("[INFO] Skip sync diagnostics: not enough heading samples.")
-        return
-
-    gps_t = gps_hdt["wall_time"].values.astype(float)
-    gps_heading = unwrap_heading_deg(gps_hdt["heading_deg"].values.astype(float))
-    imu_t = imu_quat["wall_time"].values.astype(float)
-    imu_heading = unwrap_heading_deg(_heading_from_quat_df(imu_quat))
-
-    valid_imu = np.isfinite(imu_heading)
-    imu_t = imu_t[valid_imu]
-    imu_heading = imu_heading[valid_imu]
-    if len(imu_t) < 10:
-        print("[INFO] Skip sync diagnostics: invalid IMU quaternion headings.")
-        return
-
-    lags = np.arange(-1.0, 1.0001, 0.01)
-    corr = np.full(len(lags), np.nan, dtype=float)
-    rmse = np.full(len(lags), np.nan, dtype=float)
-    offsets = np.full(len(lags), np.nan, dtype=float)
-    gps_rate = np.gradient(gps_heading, gps_t)
-
-    for i, lag in enumerate(lags):
-        target_t = gps_t + lag
-        in_range = (target_t >= imu_t[0]) & (target_t <= imu_t[-1])
-        if np.count_nonzero(in_range) < 10:
-            continue
-        imu_shift = np.interp(target_t[in_range], imu_t, imu_heading)
-        gps_shift = gps_heading[in_range]
-        offset = np.median(imu_shift - gps_shift)
-        offsets[i] = offset
-        rmse[i] = math.sqrt(float(np.mean((imu_shift - offset - gps_shift) ** 2)))
-        imu_rate = np.gradient(imu_shift, gps_t[in_range])
-        corr[i] = _pearson_corr(gps_rate[in_range], imu_rate)
-
-    if np.all(~np.isfinite(corr)):
-        print("[INFO] Skip sync diagnostics: no valid lag correlation.")
-        return
-
-    best_i = int(np.nanargmax(corr))
-    best_lag = float(lags[best_i])
-    best_corr = float(corr[best_i])
-    best_offset = float(offsets[best_i])
-    best_rmse = float(rmse[best_i])
-
-    target_t = gps_t + best_lag
-    in_range = (target_t >= imu_t[0]) & (target_t <= imu_t[-1])
-    imu_aligned = np.interp(target_t[in_range], imu_t, imu_heading) - best_offset
-    gps_aligned = gps_heading[in_range]
-    aligned_t = gps_t[in_range] - gps_t[0]
-
-    nearest_idx = np.searchsorted(imu_t, gps_t)
-    nearest_dt = np.full(len(gps_t), np.nan, dtype=float)
-    for i, idx in enumerate(nearest_idx):
-        candidates = []
-        if idx < len(imu_t):
-            candidates.append(idx)
-        if idx > 0:
-            candidates.append(idx - 1)
-        if candidates:
-            best = min(candidates, key=lambda k: abs(imu_t[k] - gps_t[i]))
-            nearest_dt[i] = imu_t[best] - gps_t[i]
-    nearest_dt_ms = nearest_dt * 1000.0
-    finite_nearest = nearest_dt_ms[np.isfinite(nearest_dt_ms)]
-    nearest_abs_ms = np.abs(finite_nearest)
-    nearest_mean_ms = float(np.mean(finite_nearest)) if len(finite_nearest) else np.nan
-    nearest_median_abs_ms = float(np.median(nearest_abs_ms)) if len(nearest_abs_ms) else np.nan
-    nearest_max_abs_ms = float(np.max(nearest_abs_ms)) if len(nearest_abs_ms) else np.nan
-    nearest_p95_abs_ms = float(np.percentile(nearest_abs_ms, 95)) if len(nearest_abs_ms) else np.nan
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
-    _safe_window_title(fig, "IMU/GPS Sync Diagnostics")
-    axes[0].plot(gps_t - gps_t[0], gps_heading, ".", markersize=3,
-                 label="GPS HDT heading")
-    axes[0].plot(imu_t - gps_t[0], imu_heading, ".", markersize=1,
-                 alpha=0.45, label="IMU quaternion heading")
-    axes[0].set_ylabel("Unwrapped heading (deg)")
-    axes[0].set_title("Raw Heading Series")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
-
-    axes[1].plot(aligned_t, gps_aligned, ".", markersize=3,
-                 label="GPS HDT")
-    axes[1].plot(aligned_t, imu_aligned, ".", markersize=2,
-                 label=f"IMU shifted {best_lag:+.2f}s, offset {best_offset:+.1f}deg")
-    axes[1].set_ylabel("Aligned heading (deg)")
-    axes[1].set_title(f"Best Alignment: corr={best_corr:.3f}, RMSE={best_rmse:.2f} deg")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
-
-    axes[2].plot(gps_t - gps_t[0], nearest_dt_ms, ".", markersize=3,
-                 label="nearest IMU time - GPS time")
-    axes[2].axhline(0.0, color="black", linewidth=0.8)
-    axes[2].axhline(1.25, color="red", linestyle="--", linewidth=0.9,
-                    label="+/- 1.25 ms for 400 Hz IMU")
-    axes[2].axhline(-1.25, color="red", linestyle="--", linewidth=0.9)
-    axes[2].set_xlabel("GPS time since start (s)")
-    axes[2].set_ylabel("Nearest IMU dt (ms)")
-    axes[2].set_title(
-        "GPS Timestamp Coverage by Nearest IMU Sample "
-        f"(median |dt|={nearest_median_abs_ms:.3f} ms, "
-        f"max |dt|={nearest_max_abs_ms:.3f} ms)"
-    )
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend()
-    plt.tight_layout()
-    fig.savefig(output_dir / "6_sync_heading_lag_diagnostics.png", dpi=150,
-                bbox_inches="tight")
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    _safe_window_title(fig, "GPS Timestamp Coverage Histogram")
-    if len(nearest_abs_ms):
-        bins = np.linspace(0.0, max(3.0, nearest_max_abs_ms), 40)
-        ax.hist(nearest_abs_ms, bins=bins, color="steelblue",
-                edgecolor="black", alpha=0.75)
-        ax.axvline(1.25, color="red", linestyle="--",
-                   label="1.25 ms = half period at 400 Hz")
-        ax.axvline(nearest_median_abs_ms, color="darkorange", linestyle="-",
-                   label=f"median {nearest_median_abs_ms:.3f} ms")
-        ax.axvline(nearest_p95_abs_ms, color="purple", linestyle=":",
-                   label=f"p95 {nearest_p95_abs_ms:.3f} ms")
-    ax.set_xlabel("|nearest IMU time - GPS time| (ms)")
-    ax.set_ylabel("GPS sample count")
-    ax.set_title("GPS Timestamp Coverage by Nearest IMU Sample")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    plt.tight_layout()
-    fig.savefig(output_dir / "7_gps_to_nearest_imu_dt_histogram.png",
-                dpi=150, bbox_inches="tight")
-
-    summary_path = output_dir / "sync_diagnostics.csv"
-    with summary_path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow([
-            "best_lag_s",
-            "heading_rate_corr",
-            "imu_minus_gps_heading_offset_deg",
-            "aligned_heading_rmse_deg",
-            "nearest_imu_minus_gps_mean_ms",
-            "nearest_abs_dt_median_ms",
-            "nearest_abs_dt_p95_ms",
-            "nearest_abs_dt_max_ms",
-            "gps_samples",
-            "imu_samples",
-        ])
-        writer.writerow([
-            f"{best_lag:.4f}",
-            f"{best_corr:.6f}",
-            f"{best_offset:.6f}",
-            f"{best_rmse:.6f}",
-            f"{nearest_mean_ms:.6f}",
-            f"{nearest_median_abs_ms:.6f}",
-            f"{nearest_p95_abs_ms:.6f}",
-            f"{nearest_max_abs_ms:.6f}",
-            len(gps_t),
-            len(imu_t),
-        ])
-    print(
-        "Sync diagnostics: "
-        f"best lag={best_lag:+.3f}s, corr={best_corr:.3f}, "
-        f"heading offset={best_offset:+.2f}deg, RMSE={best_rmse:.2f}deg, "
-        f"nearest IMU |dt| median={nearest_median_abs_ms:.3f}ms, "
-        f"max={nearest_max_abs_ms:.3f}ms"
-    )
-
-
 def load_heading_series_for_plot(data_dir, keyframes):
     """Load GPS/reference heading and IMU quaternion heading for comparison."""
     gps_headings = []
@@ -1044,7 +822,7 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     ])
 
     fig, ax = plt.subplots(figsize=(12, 10))
-    _safe_window_title(fig, "Factor Graph Trajectory")
+    fig.canvas.manager.set_window_title("Factor Graph Trajectory")
     ax.plot(gps_lons, gps_lats, "b.", markersize=4, label="GPS/reference")
     ax.plot(interp_lons, interp_lats, ".", color="seagreen", markersize=1.2,
             alpha=0.6, label="Factor graph interpolated")
@@ -1066,7 +844,7 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
                 bbox_inches="tight")
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    _safe_window_title(fig, "Factor Graph Speed")
+    fig.canvas.manager.set_window_title("Factor Graph Speed")
     ax.plot(interp_times, interp_speeds, ".", color="seagreen", markersize=1.2,
             alpha=0.6, label="Interpolated")
     ax.plot(times, speeds, "o", color="darkorange", markersize=3,
@@ -1082,7 +860,7 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
 
     # ENU top-view in meters.
     fig, ax = plt.subplots(figsize=(12, 10))
-    _safe_window_title(fig, "Factor Graph ENU Top View")
+    fig.canvas.manager.set_window_title("Factor Graph ENU Top View")
     ax.plot(gps_enu[:, 0], gps_enu[:, 1], "b.", markersize=4,
             label="GPS/reference keyframes")
     ax.plot(interp_enu[:, 0], interp_enu[:, 1], ".", color="seagreen",
@@ -1105,7 +883,7 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
 
     # 3D point view in meters.
     fig = plt.figure(figsize=(12, 9))
-    _safe_window_title(fig, "Factor Graph 3D ENU")
+    fig.canvas.manager.set_window_title("Factor Graph 3D ENU")
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(gps_enu[:, 0], gps_enu[:, 1], gps_enu[:, 2],
                c="blue", s=8, label="GPS/reference keyframes")
@@ -1126,7 +904,7 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     # IMU heading vs GPS/reference heading.
     gps_hdg, imu_hdg = load_heading_series_for_plot(data_dir, keyframes)
     fig, ax = plt.subplots(figsize=(12, 5))
-    _safe_window_title(fig, "IMU Heading vs GPS Heading")
+    fig.canvas.manager.set_window_title("IMU Heading vs GPS Heading")
     if imu_hdg:
         imu_t = [m["t"] - keyframes[0]["t"] for m in imu_hdg]
         imu_heading_unwrapped = unwrap_heading_deg(
@@ -1152,8 +930,6 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     plt.tight_layout()
     fig.savefig(output_dir / "5_heading_imu_vs_gps.png", dpi=150,
                 bbox_inches="tight")
-
-    plot_sync_diagnostics(data_dir, output_dir)
 
 
 def main():
