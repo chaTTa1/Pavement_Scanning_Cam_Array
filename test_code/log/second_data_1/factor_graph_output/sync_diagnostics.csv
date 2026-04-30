@@ -1,0 +1,2 @@
+best_lag_s,heading_rate_corr,imu_minus_gps_heading_offset_deg,aligned_heading_rmse_deg,nearest_imu_minus_gps_mean_ms,nearest_abs_dt_median_ms,nearest_abs_dt_p95_ms,nearest_abs_dt_max_ms,gps_samples,imu_samples
+-0.1100,0.563474,168.849979,2.885056,0.296220,0.810027,1.257837,2.367973,826,32768

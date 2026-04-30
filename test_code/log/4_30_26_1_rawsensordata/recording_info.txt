@@ -1,0 +1,47 @@
+Recording Session Info
+======================
+Start time:     2026-04-30 16:20:28
+Start epoch:    1777580428.640677
+OS:             Linux
+IMU port:       /dev/ttyACM2
+IMU baud:       115200
+GPS port:       /dev/ttyACM0
+GPS baud:       115200
+IMU enabled:    True
+GPS enabled:    True
+Duration:       unlimited
+Output dir:     /home/agx1/Documents/Pavement_Scanning_Cam_Array/test_code/recording_code
+Serial buffer:  65536 bytes
+Event queue:    100000 slots (blocking put)
+
+Time synchronization:
+  wall_time:        PC perf_counter anchored to time.time()
+  imu_timestamp_us: IMU hardware clock (microseconds, wraps at 2^32)
+  gps_utc:          UTC from NMEA sentences (epoch or time-of-day)
+  gps_utc_type:     'epoch' = full datetime, 'tod' = seconds since midnight
+  Alignment method: use wall_time to correlate IMU and GPS clocks offline
+  gps_raw crossref: nearest IMU wall_time/timestamp recorded per GPS sentence
+  RMC clock model:  online GPS UTC = scale * wall_time + intercept when RMC exists
+
+IMU: SYD Dynamics TransducerM TM151
+  Protocol: EasyProfile binary with CRC-16/MODBUS
+  Rate: 400 Hz
+  RAW packet (cmd 41):
+    Field order: timestamp, gyroX, gyroY, gyroZ, accX, accY, accZ, [magX, magY, magZ]
+    Gyro unit: rad/s
+    Accel unit: g (INCLUDES GRAVITY)
+  QUAT packet (cmd 32): [q1(w), q2(x), q3(y), q4(z)]
+  RPY packet (cmd 35): [roll, pitch, yaw] degrees
+  GRAVITY packet (cmd 36): [gx, gy, gz] in g (body frame)
+
+GPS: Septentrio (NMEA output)
+  Sentences: GGA, GST, HDT, RMC, VTG
+  Rate: ~10 Hz
+  RTK corrections: enabled
+
+Output files:
+  imu_raw.csv:     RAW packets (gyro + accel + mag)
+  imu_quat.csv:    QUAT packets (AHRS quaternion)
+  imu_rpy.csv:     RPY packets (AHRS euler angles)
+  imu_gravity.csv: GRAVITY packets (gravity vector body frame)
+  gps_raw.csv:     All NMEA sentences with parsed fields + raw string
