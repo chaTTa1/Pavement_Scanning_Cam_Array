@@ -46,17 +46,17 @@ if str(SCRIPT_DIR) not in sys.path:
 
 # This own-data runner reads the recorder-format files saved in rawsensordata:
 # imu_raw.csv, imu_gravity.csv, imu_quat.csv, imu_rpy.csv, gps_raw.csv.
-DEFAULT_DATA_DIR = SCRIPT_DIR / "rawsensordata"
+DEFAULT_DATA_DIR = SCRIPT_DIR / "second_data"
 DEFAULT_OUTPUT_DIR = DEFAULT_DATA_DIR / "factor_graph_output"
 
 AUTO_CONVERT_PPC = False
-FACTOR_GRAPH_DURATION_S = 300    # use None for full run
+FACTOR_GRAPH_DURATION_S = None    # use None for full run
 KEYFRAME_STRIDE = 1                # 1 = every GPS position, 5 = every 5th
-INTERP_DT_S = 0.01                 # points between GPS keyframes for plots/CSV
 
 GRAVITY_MPS2 = 9.80665
 GPS_TIME_OFFSET_S = 0.0
 MIN_GPS_FIX_QUALITY = 1
+MAX_GPS_UTC_WALL_MISMATCH_S = 1.0
 
 # Measurement and factor weights.
 GPS_POS_SIGMA_RTK_FIX = 0.10
@@ -211,6 +211,83 @@ def load_optional_csv(data_dir: Path, name: str) -> Optional[pd.DataFrame]:
     return df.sort_values("wall_time").reset_index(drop=True)
 
 
+def add_gps_measurement_time(gps_raw: pd.DataFrame) -> pd.DataFrame:
+    """Prefer GPS measurement time over serial-arrival wall_time when available."""
+    gps_raw = gps_raw.copy()
+    gps_raw["meas_time"] = gps_raw["wall_time"].astype(float)
+    if "gps_utc" not in gps_raw.columns:
+        return gps_raw
+
+    gps_raw["gps_utc"] = pd.to_numeric(gps_raw["gps_utc"], errors="coerce")
+    valid = gps_raw["gps_utc"].notna() & gps_raw["wall_time"].notna()
+    if not valid.any():
+        return gps_raw
+
+    ref_idx = gps_raw.index[valid][0]
+    ref_wall = float(gps_raw.at[ref_idx, "wall_time"])
+    ref_utc = float(gps_raw.at[ref_idx, "gps_utc"])
+    utc = gps_raw.loc[valid, "gps_utc"].values.astype(float)
+    delta = utc - ref_utc
+    delta[delta < -43200.0] += 86400.0
+    delta[delta > 43200.0] -= 86400.0
+    gps_raw.loc[valid, "meas_time"] = ref_wall + delta
+    return gps_raw
+
+
+def keep_largest_consistent_gps_segment(gga: pd.DataFrame) -> pd.DataFrame:
+    if "gps_utc" not in gga.columns or len(gga) < 3:
+        return gga
+    utc = pd.to_numeric(gga["gps_utc"], errors="coerce").values.astype(float)
+    wall = gga["wall_time"].values.astype(float)
+    if not np.isfinite(utc).any():
+        return gga
+
+    split_after = []
+    for i in range(len(gga) - 1):
+        if not (np.isfinite(utc[i]) and np.isfinite(utc[i + 1])):
+            continue
+        utc_dt = utc[i + 1] - utc[i]
+        wall_dt = wall[i + 1] - wall[i]
+        if utc_dt < -43200.0:
+            utc_dt += 86400.0
+        elif utc_dt > 43200.0:
+            utc_dt -= 86400.0
+        if abs(utc_dt - wall_dt) > MAX_GPS_UTC_WALL_MISMATCH_S:
+            split_after.append(i)
+
+    if not split_after:
+        return gga
+
+    starts = [0] + [i + 1 for i in split_after]
+    ends = [i + 1 for i in split_after] + [len(gga)]
+    lengths = [end - start for start, end in zip(starts, ends)]
+    best = int(np.argmax(lengths))
+    dropped = len(gga) - lengths[best]
+    if dropped > 0:
+        print(
+            "[INFO] Dropped "
+            f"{dropped} GGA rows outside the largest GPS-time-continuous segment."
+        )
+    return gga.iloc[starts[best]:ends[best]].copy()
+
+
+def gps_measurement_times(df: pd.DataFrame) -> np.ndarray:
+    wall = df["wall_time"].values.astype(float)
+    if "gps_utc" not in df.columns:
+        return wall
+    utc = pd.to_numeric(df["gps_utc"], errors="coerce").values.astype(float)
+    valid = np.isfinite(utc)
+    if not np.any(valid):
+        return wall
+    first = int(np.flatnonzero(valid)[0])
+    delta = utc - utc[first]
+    delta[delta < -43200.0] += 86400.0
+    delta[delta > 43200.0] -= 86400.0
+    meas_time = wall.copy()
+    meas_time[valid] = wall[first] + delta[valid]
+    return meas_time
+
+
 def compute_imu_dt(imu_raw: pd.DataFrame) -> pd.DataFrame:
     ts = imu_raw["imu_timestamp_us"].values.astype(np.int64)
     wall = imu_raw["wall_time"].values.astype(float)
@@ -313,6 +390,7 @@ def load_gps_measurements(data_dir: Path):
 
     for col in [
         "wall_time",
+        "gps_utc",
         "lat",
         "lon",
         "alt",
@@ -326,14 +404,16 @@ def load_gps_measurements(data_dir: Path):
     ]:
         if col in gps_raw.columns:
             gps_raw[col] = pd.to_numeric(gps_raw[col], errors="coerce")
+    gps_raw = add_gps_measurement_time(gps_raw)
 
     msg_type = gps_raw["msg_type"].astype(str).str.upper()
 
-    gga = gps_raw[msg_type == "GGA"].dropna(subset=["wall_time", "lat", "lon"])
+    gga = gps_raw[msg_type == "GGA"].dropna(subset=["meas_time", "lat", "lon"])
     if "fix_quality" in gga.columns:
         gga = gga[gga["fix_quality"].fillna(0).astype(int) >= MIN_GPS_FIX_QUALITY]
     else:
         gga = gga.iloc[0:0]
+    gga = keep_largest_consistent_gps_segment(gga)
 
     if len(gga):
         fq = gga["fix_quality"].astype(int).values
@@ -356,8 +436,9 @@ def load_gps_measurements(data_dir: Path):
                 MIN_GPS_POS_SIGMA,
             )
 
+        gga_time = gps_measurement_times(gga)
         pos_df = pd.DataFrame({
-            "t": gga["wall_time"].values.astype(float) + GPS_TIME_OFFSET_S,
+            "t": gga_time + GPS_TIME_OFFSET_S,
             "lat": gga["lat"].values.astype(float),
             "lon": gga["lon"].values.astype(float),
             "alt": gga["alt"].fillna(0.0).values.astype(float)
@@ -372,7 +453,7 @@ def load_gps_measurements(data_dir: Path):
     vel_frames = []
     if "speed_knots" in gps_raw.columns and "course_true_deg" in gps_raw.columns:
         rmc = gps_raw[msg_type == "RMC"].dropna(
-            subset=["wall_time", "speed_knots", "course_true_deg"]
+            subset=["meas_time", "speed_knots", "course_true_deg"]
         )
         if "rmc_status" in rmc.columns:
             rmc = rmc[rmc["rmc_status"].fillna("A").astype(str).str.strip() != "V"]
@@ -381,21 +462,21 @@ def load_gps_measurements(data_dir: Path):
             course = np.deg2rad(rmc["course_true_deg"].values.astype(float))
             keep = np.isfinite(speed) & np.isfinite(course) & (speed >= 0.05)
             vel_frames.append(pd.DataFrame({
-                "t": rmc["wall_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
+                "t": rmc["meas_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
                 "ve": speed[keep] * np.sin(course[keep]),
                 "vn": speed[keep] * np.cos(course[keep]),
             }))
 
     if "speed_kmh" in gps_raw.columns and "course_true_deg" in gps_raw.columns:
         vtg = gps_raw[msg_type == "VTG"].dropna(
-            subset=["wall_time", "speed_kmh", "course_true_deg"]
+            subset=["meas_time", "speed_kmh", "course_true_deg"]
         )
         if len(vtg):
             speed = vtg["speed_kmh"].values.astype(float) / 3.6
             course = np.deg2rad(vtg["course_true_deg"].values.astype(float))
             keep = np.isfinite(speed) & np.isfinite(course) & (speed >= 0.05)
             vel_frames.append(pd.DataFrame({
-                "t": vtg["wall_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
+                "t": vtg["meas_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
                 "ve": speed[keep] * np.sin(course[keep]),
                 "vn": speed[keep] * np.cos(course[keep]),
             }))
@@ -603,70 +684,94 @@ def save_results(x, keyframes, output_dir, ref_lat, ref_lon, ref_alt):
     print(f"Saved factor graph trajectory: {path}")
 
 
-def hermite_position(pi, vi, pj, vj, dt, tau):
-    """Cubic Hermite interpolation from optimized endpoint p/v states."""
-    h00 = 2.0 * tau ** 3 - 3.0 * tau ** 2 + 1.0
-    h10 = tau ** 3 - 2.0 * tau ** 2 + tau
-    h01 = -2.0 * tau ** 3 + 3.0 * tau ** 2
-    h11 = tau ** 3 - tau ** 2
-    return h00 * pi + h10 * dt * vi + h01 * pj + h11 * dt * vj
+def build_imu_rate_results(x, keyframes, imu, ref_lat, ref_lon, ref_alt):
+    """Build dense GPS+IMU fused points at real IMU sample timestamps.
 
-
-def hermite_velocity(pi, vi, pj, vj, dt, tau):
-    """Velocity is the time derivative of hermite_position."""
-    if dt <= 0:
-        return vi.copy()
-    dh00 = 6.0 * tau ** 2 - 6.0 * tau
-    dh10 = 3.0 * tau ** 2 - 4.0 * tau + 1.0
-    dh01 = -6.0 * tau ** 2 + 6.0 * tau
-    dh11 = 3.0 * tau ** 2 - 2.0 * tau
-    return (dh00 * pi + dh01 * pj) / dt + dh10 * vi + dh11 * vj
-
-
-def build_interpolated_results(x, keyframes, ref_lat, ref_lon, ref_alt):
-    """
-    Create multiple factor-graph trajectory points between GPS keyframes.
-
-    The optimizer only estimates states at GPS keyframes. For visualization,
-    this uses cubic Hermite interpolation with optimized endpoint position and
-    velocity, so each GPS interval contains many factor-graph points.
+    The optimizer estimates states only at GPS keyframes. A raw IMU propagation
+    from keyframe i usually will not land exactly on optimized keyframe i+1.
+    To avoid a visible reset at every GPS point, we propagate at real IMU
+    timestamps, then apply a smooth endpoint correction so each dense segment
+    respects both optimized keyframes.
     """
     rows = []
     if len(keyframes) == 0:
         return rows
 
+    imu_t = imu["wall_time"].values.astype(float)
+    imu_acc = imu[["acc_e", "acc_n", "acc_u"]].values.astype(float)
+
+    def corrected_state(p_raw, v_raw, tau, dt_total, p_err, v_err):
+        tau = float(np.clip(tau, 0.0, 1.0))
+        if dt_total <= 0.0:
+            return p_raw, v_raw
+        h01 = -2.0 * tau ** 3 + 3.0 * tau ** 2
+        h11 = tau ** 3 - tau ** 2
+        dh01 = -6.0 * tau ** 2 + 6.0 * tau
+        dh11 = 3.0 * tau ** 2 - 2.0 * tau
+        p_corr = p_raw + h01 * p_err + h11 * dt_total * v_err
+        v_corr = v_raw + (dh01 / dt_total) * p_err + dh11 * v_err
+        return p_corr, v_corr
+
     for i in range(len(keyframes) - 1):
-        xi = x[6 * i: 6 * i + 6]
-        xj = x[6 * (i + 1): 6 * (i + 1) + 6]
+        state = x[6 * i: 6 * i + 6]
+        next_state = x[6 * (i + 1): 6 * (i + 1) + 6]
+        p0 = state[0:3].copy()
+        v0 = state[3:6].copy()
+        p_next = next_state[0:3].copy()
+        v_next = next_state[3:6].copy()
         ti = keyframes[i]["t"]
         tj = keyframes[i + 1]["t"]
-        dt = tj - ti
-        if dt <= 0:
+        if tj <= ti:
             continue
 
-        n_steps = max(2, int(math.ceil(dt / INTERP_DT_S)))
-        for s in range(n_steps):
-            tau = s / n_steps
-            t = ti + tau * dt
-            p = hermite_position(xi[0:3], xi[3:6], xj[0:3], xj[3:6], dt, tau)
-            v = hermite_velocity(xi[0:3], xi[3:6], xj[0:3], xj[3:6], dt, tau)
-            lat, lon, alt = enu_to_gps(p, ref_lat, ref_lon, ref_alt)
+        idx0 = int(np.searchsorted(imu_t, ti, side="left"))
+        idx1 = int(np.searchsorted(imu_t, tj, side="left"))
+        raw_points = [(ti, p0.copy(), v0.copy(), "gps_imu_fused_keyframe")]
+        p = p0.copy()
+        v = v0.copy()
+        for k in range(idx0, idx1):
+            if k + 1 < len(imu_t):
+                t1 = min(float(imu_t[k + 1]), tj)
+            else:
+                t1 = tj
+            t0 = max(float(imu_t[k]), ti)
+            dt = t1 - t0
+            if dt <= 0.0 or dt > MAX_IMU_DT:
+                continue
+            a = imu_acc[k]
+            p = p + v * dt + 0.5 * a * dt * dt
+            v = v + a * dt
+            raw_points.append((t1, p.copy(), v.copy(), "gps_imu_fused_imu_rate"))
+
+        if raw_points[-1][0] < tj:
+            raw_points.append((tj, p.copy(), v.copy(), "gps_imu_fused_imu_rate"))
+
+        p_raw_end = raw_points[-1][1]
+        v_raw_end = raw_points[-1][2]
+        p_err = p_next - p_raw_end
+        v_err = v_next - v_raw_end
+        dt_total = tj - ti
+        for t, p_raw, v_raw, source in raw_points:
+            tau = (t - ti) / dt_total
+            p_corr, v_corr = corrected_state(
+                p_raw, v_raw, tau, dt_total, p_err, v_err)
+            lat, lon, alt = enu_to_gps(p_corr, ref_lat, ref_lon, ref_alt)
             rows.append({
                 "wall_time": t,
-                "source": "interpolated",
+                "source": source,
                 "lat": lat,
                 "lon": lon,
                 "alt": alt,
-                "ve": v[0],
-                "vn": v[1],
-                "vu": v[2],
+                "ve": v_corr[0],
+                "vn": v_corr[1],
+                "vu": v_corr[2],
             })
 
     last = x[6 * (len(keyframes) - 1): 6 * len(keyframes)]
     lat, lon, alt = enu_to_gps(last[0:3], ref_lat, ref_lon, ref_alt)
     rows.append({
         "wall_time": keyframes[-1]["t"],
-        "source": "interpolated",
+        "source": "gps_imu_fused_keyframe",
         "lat": lat,
         "lon": lon,
         "alt": alt,
@@ -677,17 +782,17 @@ def build_interpolated_results(x, keyframes, ref_lat, ref_lon, ref_alt):
     return rows
 
 
-def save_interpolated_results(interp_rows, output_dir):
-    path = output_dir / "position_factor_graph_interpolated.csv"
+def save_imu_rate_results(imu_rate_rows, output_dir):
+    path = output_dir / "position_factor_graph_imu_rate.csv"
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=["wall_time", "source", "lat", "lon", "alt", "ve", "vn", "vu"],
         )
         writer.writeheader()
-        for row in interp_rows:
+        for row in imu_rate_rows:
             writer.writerow(row)
-    print(f"Saved interpolated factor graph trajectory: {path}")
+    print(f"Saved GPS+IMU fused IMU-rate trajectory: {path}")
 
 
 def heading_from_quat_row(row):
@@ -1005,7 +1110,7 @@ def load_heading_series_for_plot(data_dir, keyframes):
     return gps_headings, imu_headings
 
 
-def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
+def plot_results(x, keyframes, imu_rate_rows, output_dir, ref_lat, ref_lon,
                  ref_alt, data_dir):
     fg_lats = []
     fg_lons = []
@@ -1026,13 +1131,13 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
         times.append(kf["t"] - keyframes[0]["t"])
         speeds.append(math.hypot(state[3], state[4]))
 
-    interp_lats = [row["lat"] for row in interp_rows]
-    interp_lons = [row["lon"] for row in interp_rows]
-    interp_times = [row["wall_time"] - keyframes[0]["t"] for row in interp_rows]
-    interp_speeds = [math.hypot(row["ve"], row["vn"]) for row in interp_rows]
-    interp_enu = np.array([
+    imu_rate_lats = [row["lat"] for row in imu_rate_rows]
+    imu_rate_lons = [row["lon"] for row in imu_rate_rows]
+    imu_rate_times = [row["wall_time"] - keyframes[0]["t"] for row in imu_rate_rows]
+    imu_rate_speeds = [math.hypot(row["ve"], row["vn"]) for row in imu_rate_rows]
+    imu_rate_enu = np.array([
         gps_to_enu(row["lat"], row["lon"], row["alt"], ref_lat, ref_lon, ref_alt)
-        for row in interp_rows
+        for row in imu_rate_rows
     ])
     fg_enu = np.array([
         gps_to_enu(lat, lon, alt, ref_lat, ref_lon, ref_alt)
@@ -1046,17 +1151,17 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     fig, ax = plt.subplots(figsize=(12, 10))
     _safe_window_title(fig, "Factor Graph Trajectory")
     ax.plot(gps_lons, gps_lats, "b.", markersize=4, label="GPS/reference")
-    ax.plot(interp_lons, interp_lats, ".", color="seagreen", markersize=1.2,
-            alpha=0.6, label="Factor graph interpolated")
+    ax.plot(imu_rate_lons, imu_rate_lats, ".", color="seagreen", markersize=1.2,
+            alpha=0.6, label="GPS+IMU fused IMU-rate points")
     ax.plot(fg_lons, fg_lats, "o", color="darkorange", markersize=3,
-            label="Factor graph keyframes")
+            label="GPS+IMU fused keyframes")
     ax.scatter(gps_lons[0], gps_lats[0], c="green", s=80, marker="^",
                label="Start", zorder=5)
     ax.scatter(gps_lons[-1], gps_lats[-1], c="red", s=80, marker="s",
                label="End", zorder=5)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title("Factor Graph GPS/IMU Trajectory with Interpolated Points")
+    ax.set_title("GPS+IMU Fused Trajectory: Real IMU-Rate Points Between GPS")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -1067,10 +1172,10 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
 
     fig, ax = plt.subplots(figsize=(12, 5))
     _safe_window_title(fig, "Factor Graph Speed")
-    ax.plot(interp_times, interp_speeds, ".", color="seagreen", markersize=1.2,
-            alpha=0.6, label="Interpolated")
+    ax.plot(imu_rate_times, imu_rate_speeds, ".", color="seagreen", markersize=1.2,
+            alpha=0.6, label="GPS+IMU fused IMU-rate points")
     ax.plot(times, speeds, "o", color="darkorange", markersize=3,
-            label="Keyframes")
+            label="GPS+IMU fused keyframes")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Speed (m/s)")
     ax.set_title("Factor Graph Speed")
@@ -1085,10 +1190,10 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     _safe_window_title(fig, "Factor Graph ENU Top View")
     ax.plot(gps_enu[:, 0], gps_enu[:, 1], "b.", markersize=4,
             label="GPS/reference keyframes")
-    ax.plot(interp_enu[:, 0], interp_enu[:, 1], ".", color="seagreen",
-            markersize=1.2, alpha=0.6, label="Factor graph interpolated")
+    ax.plot(imu_rate_enu[:, 0], imu_rate_enu[:, 1], ".", color="seagreen",
+            markersize=1.2, alpha=0.6, label="GPS+IMU fused IMU-rate points")
     ax.plot(fg_enu[:, 0], fg_enu[:, 1], "o", color="darkorange",
-            markersize=3, label="Factor graph keyframes")
+            markersize=3, label="GPS+IMU fused keyframes")
     ax.scatter(gps_enu[0, 0], gps_enu[0, 1], c="green", s=80,
                marker="^", zorder=5, label="Start")
     ax.scatter(gps_enu[-1, 0], gps_enu[-1, 1], c="red", s=80,
@@ -1109,11 +1214,11 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(gps_enu[:, 0], gps_enu[:, 1], gps_enu[:, 2],
                c="blue", s=8, label="GPS/reference keyframes")
-    ax.scatter(interp_enu[:, 0], interp_enu[:, 1], interp_enu[:, 2],
+    ax.scatter(imu_rate_enu[:, 0], imu_rate_enu[:, 1], imu_rate_enu[:, 2],
                c="seagreen", s=2, alpha=0.55,
-               label="Factor graph interpolated")
+               label="GPS+IMU fused IMU-rate points")
     ax.scatter(fg_enu[:, 0], fg_enu[:, 1], fg_enu[:, 2],
-               c="darkorange", s=10, label="Factor graph keyframes")
+               c="darkorange", s=10, label="GPS+IMU fused keyframes")
     ax.set_xlabel("East (m)")
     ax.set_ylabel("North (m)")
     ax.set_zlabel("Up (m)")
@@ -1224,11 +1329,11 @@ def main():
     print(f"Message:       {result.message}")
 
     save_results(result.x, keyframes, output_dir, ref_lat, ref_lon, ref_alt)
-    interp_rows = build_interpolated_results(
-        result.x, keyframes, ref_lat, ref_lon, ref_alt)
-    save_interpolated_results(interp_rows, output_dir)
+    imu_rate_rows = build_imu_rate_results(
+        result.x, keyframes, imu, ref_lat, ref_lon, ref_alt)
+    save_imu_rate_results(imu_rate_rows, output_dir)
     plot_results(
-        result.x, keyframes, interp_rows, output_dir,
+        result.x, keyframes, imu_rate_rows, output_dir,
         ref_lat, ref_lon, ref_alt, data_dir)
 
     print("=" * 60)

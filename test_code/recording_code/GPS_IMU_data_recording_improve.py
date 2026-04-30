@@ -477,6 +477,9 @@ def parse_args():
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--duration", type=float, default=None,
                         help="Recording duration in seconds (None=until Ctrl+C)")
+    parser.add_argument("--warmup-s", type=float, default=2.0,
+                        help=("Seconds to read and discard sensor data before "
+                              "recording starts"))
     parser.add_argument("--output-dir", type=str, default=".",
                         help="Output directory for CSV files")
     return parser.parse_args()
@@ -498,6 +501,7 @@ OS_NAME = detect_os()
 IMU_ENABLED = not _args.no_imu
 GPS_ENABLED = not _args.no_gps
 RECORD_DURATION = _args.duration
+WARMUP_S = max(0.0, _args.warmup_s)
 OUTPUT_DIR = _args.output_dir
 
 IMU_PORT, GPS_PORT = resolve_ports(OS_NAME, _args)
@@ -529,6 +533,7 @@ if RECORD_DURATION:
     print(f"Duration: {RECORD_DURATION:.0f} seconds")
 else:
     print(f"Duration: until Ctrl+C")
+print(f"Warmup discard: {WARMUP_S:.1f} seconds")
 
 
 # ─────────────────────────────────────────────
@@ -1355,6 +1360,63 @@ def enlarge_serial_buffer(ser, size=SERIAL_BUFFER_SIZE):
         print(f"  Serial RX buffer resize not supported (OS manages it)")
 
 
+def clear_serial_input_buffer(ser, name):
+    if ser is None:
+        return
+    try:
+        waiting = ser.in_waiting
+    except (AttributeError, serial.SerialException, OSError):
+        waiting = None
+
+    try:
+        ser.reset_input_buffer()
+        if waiting is None:
+            print(f"  {name} RX buffer cleared")
+        else:
+            print(f"  {name} RX buffer cleared ({waiting} bytes discarded)")
+    except (AttributeError, serial.SerialException, OSError) as exc:
+        print(f"  {name} RX buffer clear not supported: {exc}")
+
+
+def drain_event_queue(event_q):
+    count = 0
+    while True:
+        try:
+            event_q.get_nowait()
+            count += 1
+        except queue.Empty:
+            break
+    return count
+
+
+def warmup_sensor_threads(event_q, warmup_s):
+    if warmup_s <= 0.0:
+        return 0, 0
+
+    print()
+    print(f"[WARMUP] Reading sensors for {warmup_s:.1f}s before logging...")
+    print("[WARMUP] Data during this period is discarded.")
+
+    start = wall_clock()
+    imu_events = 0
+    gps_events = 0
+    while wall_clock() - start < warmup_s:
+        try:
+            wt, evt_type, payload = event_q.get(timeout=0.05)
+        except queue.Empty:
+            continue
+
+        if evt_type == EVENT_IMU:
+            imu_events += 1
+        elif evt_type == EVENT_GPS:
+            gps_events += 1
+
+    discarded = drain_event_queue(event_q)
+    print(f"[WARMUP] Discarded {imu_events} IMU events, "
+          f"{gps_events} GPS events, plus {discarded} queued events.")
+    return imu_events, gps_events
+
+
 # ─────────────────────────────────────────────
 # DEVICE VALIDATION
 # ─────────────────────────────────────────────
@@ -1418,6 +1480,7 @@ def write_recording_info(output_dir, imu_port, gps_port,
         f.write(f"IMU enabled:    {IMU_ENABLED}\n")
         f.write(f"GPS enabled:    {GPS_ENABLED}\n")
         f.write(f"Duration:       {RECORD_DURATION if RECORD_DURATION else 'unlimited'}\n")
+        f.write(f"Warmup discard: {WARMUP_S:.1f} seconds\n")
         f.write(f"Output dir:     {os.path.abspath(output_dir)}\n")
         f.write(f"Serial buffer:  {SERIAL_BUFFER_SIZE} bytes\n")
         f.write(f"Event queue:    {EVENT_QUEUE_SIZE} slots (blocking put)\n")
@@ -1574,11 +1637,14 @@ def main():
             imu_ser = serial.Serial(IMU_PORT, IMU_BAUD, timeout=0.01)
             enlarge_serial_buffer(imu_ser)
             print(f"Opened IMU: {IMU_PORT} @ {IMU_BAUD}")
+            clear_serial_input_buffer(imu_ser, "IMU")
             temp_reader = IMUPacketReader(imu_ser)
             if not validate_imu_connection(temp_reader):
                 print("[WARNING] IMU not responding. Disabling.")
                 imu_ser.close()
                 imu_ser = None
+            else:
+                clear_serial_input_buffer(imu_ser, "IMU")
         except serial.SerialException as exc:
             print(f"[WARNING] Could not open IMU: {exc}")
 
@@ -1588,22 +1654,19 @@ def main():
             gps_ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=0.1)
             enlarge_serial_buffer(gps_ser)
             print(f"Opened GPS: {GPS_PORT} @ {GPS_BAUD}")
+            clear_serial_input_buffer(gps_ser, "GPS")
             if not validate_gps_connection(gps_ser):
                 print("[WARNING] GPS not responding. Disabling.")
                 gps_ser.close()
                 gps_ser = None
+            else:
+                clear_serial_input_buffer(gps_ser, "GPS")
         except serial.SerialException as exc:
             print(f"[WARNING] Could not open GPS: {exc}")
 
     if imu_ser is None and gps_ser is None:
         print("[ERROR] No sensors available. Exiting.")
         return
-
-    # ── Write recording info ──
-    record_start_time = wall_clock()
-    write_recording_info(
-        OUTPUT_DIR, IMU_PORT, GPS_PORT,
-        IMU_BAUD, GPS_BAUD, record_start_time)
 
     # ── Start reader threads ──
     if imu_ser is not None:
@@ -1615,6 +1678,13 @@ def main():
         gps_thread = GPSReaderThread(gps_ser, event_q, stop_event)
         gps_thread.start()
         print("[THREAD] GPS reader started → event_q (blocking put)")
+
+    warmup_sensor_threads(event_q, WARMUP_S)
+
+    record_start_time = wall_clock()
+    write_recording_info(
+        OUTPUT_DIR, IMU_PORT, GPS_PORT,
+        IMU_BAUD, GPS_BAUD, record_start_time)
 
     print()
     print("=" * 60)

@@ -46,17 +46,17 @@ if str(SCRIPT_DIR) not in sys.path:
 
 # This own-data runner reads the recorder-format files saved in rawsensordata:
 # imu_raw.csv, imu_gravity.csv, imu_quat.csv, imu_rpy.csv, gps_raw.csv.
-DEFAULT_DATA_DIR = SCRIPT_DIR / "rawsensordata"
+DEFAULT_DATA_DIR = SCRIPT_DIR / "second_data"
 DEFAULT_OUTPUT_DIR = DEFAULT_DATA_DIR / "factor_graph_output"
 
 AUTO_CONVERT_PPC = False
 FACTOR_GRAPH_DURATION_S = 300    # use None for full run
 KEYFRAME_STRIDE = 1                # 1 = every GPS position, 5 = every 5th
-INTERP_DT_S = 0.01                 # points between GPS keyframes for plots/CSV
 
 GRAVITY_MPS2 = 9.80665
 GPS_TIME_OFFSET_S = 0.0
 MIN_GPS_FIX_QUALITY = 1
+MAX_GPS_UTC_WALL_MISMATCH_S = 1.0
 
 # Measurement and factor weights.
 GPS_POS_SIGMA_RTK_FIX = 0.10
@@ -211,6 +211,83 @@ def load_optional_csv(data_dir: Path, name: str) -> Optional[pd.DataFrame]:
     return df.sort_values("wall_time").reset_index(drop=True)
 
 
+def add_gps_measurement_time(gps_raw: pd.DataFrame) -> pd.DataFrame:
+    """Prefer GPS measurement time over serial-arrival wall_time when available."""
+    gps_raw = gps_raw.copy()
+    gps_raw["meas_time"] = gps_raw["wall_time"].astype(float)
+    if "gps_utc" not in gps_raw.columns:
+        return gps_raw
+
+    gps_raw["gps_utc"] = pd.to_numeric(gps_raw["gps_utc"], errors="coerce")
+    valid = gps_raw["gps_utc"].notna() & gps_raw["wall_time"].notna()
+    if not valid.any():
+        return gps_raw
+
+    ref_idx = gps_raw.index[valid][0]
+    ref_wall = float(gps_raw.at[ref_idx, "wall_time"])
+    ref_utc = float(gps_raw.at[ref_idx, "gps_utc"])
+    utc = gps_raw.loc[valid, "gps_utc"].values.astype(float)
+    delta = utc - ref_utc
+    delta[delta < -43200.0] += 86400.0
+    delta[delta > 43200.0] -= 86400.0
+    gps_raw.loc[valid, "meas_time"] = ref_wall + delta
+    return gps_raw
+
+
+def keep_largest_consistent_gps_segment(gga: pd.DataFrame) -> pd.DataFrame:
+    if "gps_utc" not in gga.columns or len(gga) < 3:
+        return gga
+    utc = pd.to_numeric(gga["gps_utc"], errors="coerce").values.astype(float)
+    wall = gga["wall_time"].values.astype(float)
+    if not np.isfinite(utc).any():
+        return gga
+
+    split_after = []
+    for i in range(len(gga) - 1):
+        if not (np.isfinite(utc[i]) and np.isfinite(utc[i + 1])):
+            continue
+        utc_dt = utc[i + 1] - utc[i]
+        wall_dt = wall[i + 1] - wall[i]
+        if utc_dt < -43200.0:
+            utc_dt += 86400.0
+        elif utc_dt > 43200.0:
+            utc_dt -= 86400.0
+        if abs(utc_dt - wall_dt) > MAX_GPS_UTC_WALL_MISMATCH_S:
+            split_after.append(i)
+
+    if not split_after:
+        return gga
+
+    starts = [0] + [i + 1 for i in split_after]
+    ends = [i + 1 for i in split_after] + [len(gga)]
+    lengths = [end - start for start, end in zip(starts, ends)]
+    best = int(np.argmax(lengths))
+    dropped = len(gga) - lengths[best]
+    if dropped > 0:
+        print(
+            "[INFO] Dropped "
+            f"{dropped} GGA rows outside the largest GPS-time-continuous segment."
+        )
+    return gga.iloc[starts[best]:ends[best]].copy()
+
+
+def gps_measurement_times(df: pd.DataFrame) -> np.ndarray:
+    wall = df["wall_time"].values.astype(float)
+    if "gps_utc" not in df.columns:
+        return wall
+    utc = pd.to_numeric(df["gps_utc"], errors="coerce").values.astype(float)
+    valid = np.isfinite(utc)
+    if not np.any(valid):
+        return wall
+    first = int(np.flatnonzero(valid)[0])
+    delta = utc - utc[first]
+    delta[delta < -43200.0] += 86400.0
+    delta[delta > 43200.0] -= 86400.0
+    meas_time = wall.copy()
+    meas_time[valid] = wall[first] + delta[valid]
+    return meas_time
+
+
 def compute_imu_dt(imu_raw: pd.DataFrame) -> pd.DataFrame:
     ts = imu_raw["imu_timestamp_us"].values.astype(np.int64)
     wall = imu_raw["wall_time"].values.astype(float)
@@ -313,6 +390,7 @@ def load_gps_measurements(data_dir: Path):
 
     for col in [
         "wall_time",
+        "gps_utc",
         "lat",
         "lon",
         "alt",
@@ -326,14 +404,16 @@ def load_gps_measurements(data_dir: Path):
     ]:
         if col in gps_raw.columns:
             gps_raw[col] = pd.to_numeric(gps_raw[col], errors="coerce")
+    gps_raw = add_gps_measurement_time(gps_raw)
 
     msg_type = gps_raw["msg_type"].astype(str).str.upper()
 
-    gga = gps_raw[msg_type == "GGA"].dropna(subset=["wall_time", "lat", "lon"])
+    gga = gps_raw[msg_type == "GGA"].dropna(subset=["meas_time", "lat", "lon"])
     if "fix_quality" in gga.columns:
         gga = gga[gga["fix_quality"].fillna(0).astype(int) >= MIN_GPS_FIX_QUALITY]
     else:
         gga = gga.iloc[0:0]
+    gga = keep_largest_consistent_gps_segment(gga)
 
     if len(gga):
         fq = gga["fix_quality"].astype(int).values
@@ -356,8 +436,9 @@ def load_gps_measurements(data_dir: Path):
                 MIN_GPS_POS_SIGMA,
             )
 
+        gga_time = gps_measurement_times(gga)
         pos_df = pd.DataFrame({
-            "t": gga["wall_time"].values.astype(float) + GPS_TIME_OFFSET_S,
+            "t": gga_time + GPS_TIME_OFFSET_S,
             "lat": gga["lat"].values.astype(float),
             "lon": gga["lon"].values.astype(float),
             "alt": gga["alt"].fillna(0.0).values.astype(float)
@@ -372,7 +453,7 @@ def load_gps_measurements(data_dir: Path):
     vel_frames = []
     if "speed_knots" in gps_raw.columns and "course_true_deg" in gps_raw.columns:
         rmc = gps_raw[msg_type == "RMC"].dropna(
-            subset=["wall_time", "speed_knots", "course_true_deg"]
+            subset=["meas_time", "speed_knots", "course_true_deg"]
         )
         if "rmc_status" in rmc.columns:
             rmc = rmc[rmc["rmc_status"].fillna("A").astype(str).str.strip() != "V"]
@@ -381,21 +462,21 @@ def load_gps_measurements(data_dir: Path):
             course = np.deg2rad(rmc["course_true_deg"].values.astype(float))
             keep = np.isfinite(speed) & np.isfinite(course) & (speed >= 0.05)
             vel_frames.append(pd.DataFrame({
-                "t": rmc["wall_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
+                "t": rmc["meas_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
                 "ve": speed[keep] * np.sin(course[keep]),
                 "vn": speed[keep] * np.cos(course[keep]),
             }))
 
     if "speed_kmh" in gps_raw.columns and "course_true_deg" in gps_raw.columns:
         vtg = gps_raw[msg_type == "VTG"].dropna(
-            subset=["wall_time", "speed_kmh", "course_true_deg"]
+            subset=["meas_time", "speed_kmh", "course_true_deg"]
         )
         if len(vtg):
             speed = vtg["speed_kmh"].values.astype(float) / 3.6
             course = np.deg2rad(vtg["course_true_deg"].values.astype(float))
             keep = np.isfinite(speed) & np.isfinite(course) & (speed >= 0.05)
             vel_frames.append(pd.DataFrame({
-                "t": vtg["wall_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
+                "t": vtg["meas_time"].values.astype(float)[keep] + GPS_TIME_OFFSET_S,
                 "ve": speed[keep] * np.sin(course[keep]),
                 "vn": speed[keep] * np.cos(course[keep]),
             }))
@@ -603,70 +684,94 @@ def save_results(x, keyframes, output_dir, ref_lat, ref_lon, ref_alt):
     print(f"Saved factor graph trajectory: {path}")
 
 
-def hermite_position(pi, vi, pj, vj, dt, tau):
-    """Cubic Hermite interpolation from optimized endpoint p/v states."""
-    h00 = 2.0 * tau ** 3 - 3.0 * tau ** 2 + 1.0
-    h10 = tau ** 3 - 2.0 * tau ** 2 + tau
-    h01 = -2.0 * tau ** 3 + 3.0 * tau ** 2
-    h11 = tau ** 3 - tau ** 2
-    return h00 * pi + h10 * dt * vi + h01 * pj + h11 * dt * vj
+def build_imu_rate_results(x, keyframes, imu, ref_lat, ref_lon, ref_alt):
+    """Build dense GPS+IMU fused points at real IMU sample timestamps.
 
-
-def hermite_velocity(pi, vi, pj, vj, dt, tau):
-    """Velocity is the time derivative of hermite_position."""
-    if dt <= 0:
-        return vi.copy()
-    dh00 = 6.0 * tau ** 2 - 6.0 * tau
-    dh10 = 3.0 * tau ** 2 - 4.0 * tau + 1.0
-    dh01 = -6.0 * tau ** 2 + 6.0 * tau
-    dh11 = 3.0 * tau ** 2 - 2.0 * tau
-    return (dh00 * pi + dh01 * pj) / dt + dh10 * vi + dh11 * vj
-
-
-def build_interpolated_results(x, keyframes, ref_lat, ref_lon, ref_alt):
-    """
-    Create multiple factor-graph trajectory points between GPS keyframes.
-
-    The optimizer only estimates states at GPS keyframes. For visualization,
-    this uses cubic Hermite interpolation with optimized endpoint position and
-    velocity, so each GPS interval contains many factor-graph points.
+    The optimizer estimates states only at GPS keyframes. A raw IMU propagation
+    from keyframe i usually will not land exactly on optimized keyframe i+1.
+    To avoid a visible reset at every GPS point, we propagate at real IMU
+    timestamps, then apply a smooth endpoint correction so each dense segment
+    respects both optimized keyframes.
     """
     rows = []
     if len(keyframes) == 0:
         return rows
 
+    imu_t = imu["wall_time"].values.astype(float)
+    imu_acc = imu[["acc_e", "acc_n", "acc_u"]].values.astype(float)
+
+    def corrected_state(p_raw, v_raw, tau, dt_total, p_err, v_err):
+        tau = float(np.clip(tau, 0.0, 1.0))
+        if dt_total <= 0.0:
+            return p_raw, v_raw
+        h01 = -2.0 * tau ** 3 + 3.0 * tau ** 2
+        h11 = tau ** 3 - tau ** 2
+        dh01 = -6.0 * tau ** 2 + 6.0 * tau
+        dh11 = 3.0 * tau ** 2 - 2.0 * tau
+        p_corr = p_raw + h01 * p_err + h11 * dt_total * v_err
+        v_corr = v_raw + (dh01 / dt_total) * p_err + dh11 * v_err
+        return p_corr, v_corr
+
     for i in range(len(keyframes) - 1):
-        xi = x[6 * i: 6 * i + 6]
-        xj = x[6 * (i + 1): 6 * (i + 1) + 6]
+        state = x[6 * i: 6 * i + 6]
+        next_state = x[6 * (i + 1): 6 * (i + 1) + 6]
+        p0 = state[0:3].copy()
+        v0 = state[3:6].copy()
+        p_next = next_state[0:3].copy()
+        v_next = next_state[3:6].copy()
         ti = keyframes[i]["t"]
         tj = keyframes[i + 1]["t"]
-        dt = tj - ti
-        if dt <= 0:
+        if tj <= ti:
             continue
 
-        n_steps = max(2, int(math.ceil(dt / INTERP_DT_S)))
-        for s in range(n_steps):
-            tau = s / n_steps
-            t = ti + tau * dt
-            p = hermite_position(xi[0:3], xi[3:6], xj[0:3], xj[3:6], dt, tau)
-            v = hermite_velocity(xi[0:3], xi[3:6], xj[0:3], xj[3:6], dt, tau)
-            lat, lon, alt = enu_to_gps(p, ref_lat, ref_lon, ref_alt)
+        idx0 = int(np.searchsorted(imu_t, ti, side="left"))
+        idx1 = int(np.searchsorted(imu_t, tj, side="left"))
+        raw_points = [(ti, p0.copy(), v0.copy(), "gps_imu_fused_keyframe")]
+        p = p0.copy()
+        v = v0.copy()
+        for k in range(idx0, idx1):
+            if k + 1 < len(imu_t):
+                t1 = min(float(imu_t[k + 1]), tj)
+            else:
+                t1 = tj
+            t0 = max(float(imu_t[k]), ti)
+            dt = t1 - t0
+            if dt <= 0.0 or dt > MAX_IMU_DT:
+                continue
+            a = imu_acc[k]
+            p = p + v * dt + 0.5 * a * dt * dt
+            v = v + a * dt
+            raw_points.append((t1, p.copy(), v.copy(), "gps_imu_fused_imu_rate"))
+
+        if raw_points[-1][0] < tj:
+            raw_points.append((tj, p.copy(), v.copy(), "gps_imu_fused_imu_rate"))
+
+        p_raw_end = raw_points[-1][1]
+        v_raw_end = raw_points[-1][2]
+        p_err = p_next - p_raw_end
+        v_err = v_next - v_raw_end
+        dt_total = tj - ti
+        for t, p_raw, v_raw, source in raw_points:
+            tau = (t - ti) / dt_total
+            p_corr, v_corr = corrected_state(
+                p_raw, v_raw, tau, dt_total, p_err, v_err)
+            lat, lon, alt = enu_to_gps(p_corr, ref_lat, ref_lon, ref_alt)
             rows.append({
                 "wall_time": t,
-                "source": "interpolated",
+                "source": source,
                 "lat": lat,
                 "lon": lon,
                 "alt": alt,
-                "ve": v[0],
-                "vn": v[1],
-                "vu": v[2],
+                "ve": v_corr[0],
+                "vn": v_corr[1],
+                "vu": v_corr[2],
             })
 
     last = x[6 * (len(keyframes) - 1): 6 * len(keyframes)]
     lat, lon, alt = enu_to_gps(last[0:3], ref_lat, ref_lon, ref_alt)
     rows.append({
         "wall_time": keyframes[-1]["t"],
-        "source": "interpolated",
+        "source": "gps_imu_fused_keyframe",
         "lat": lat,
         "lon": lon,
         "alt": alt,
@@ -677,17 +782,17 @@ def build_interpolated_results(x, keyframes, ref_lat, ref_lon, ref_alt):
     return rows
 
 
-def save_interpolated_results(interp_rows, output_dir):
-    path = output_dir / "position_factor_graph_interpolated.csv"
+def save_imu_rate_results(imu_rate_rows, output_dir):
+    path = output_dir / "position_factor_graph_imu_rate.csv"
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=["wall_time", "source", "lat", "lon", "alt", "ve", "vn", "vu"],
         )
         writer.writeheader()
-        for row in interp_rows:
+        for row in imu_rate_rows:
             writer.writerow(row)
-    print(f"Saved interpolated factor graph trajectory: {path}")
+    print(f"Saved GPS+IMU fused IMU-rate trajectory: {path}")
 
 
 def heading_from_quat_row(row):
@@ -722,6 +827,228 @@ def unwrap_heading_deg(values):
         [[valid_values[0]], valid_values[0] + np.cumsum(diff)]
     )
     return out
+
+
+def _safe_window_title(fig, title: str):
+    try:
+        if fig.canvas.manager is not None:
+            fig.canvas.manager.set_window_title(title)
+    except AttributeError:
+        pass
+
+
+def _pearson_corr(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if np.count_nonzero(valid) < 5:
+        return np.nan
+    a = a[valid] - np.mean(a[valid])
+    b = b[valid] - np.mean(b[valid])
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom < 1e-12:
+        return np.nan
+    return float(np.dot(a, b) / denom)
+
+
+def _heading_from_quat_df(imu_quat):
+    q_wxyz = imu_quat[["q1", "q2", "q3", "q4"]].values.astype(float)
+    valid = np.isfinite(q_wxyz).all(axis=1)
+    q_xyzw = q_wxyz[:, [1, 2, 3, 0]]
+    q_norm = np.linalg.norm(q_xyzw, axis=1)
+    valid &= q_norm > 1e-12
+    headings = np.full(len(imu_quat), np.nan, dtype=float)
+    if np.any(valid):
+        forward = Rot.from_quat(q_xyzw[valid] / q_norm[valid, None]).apply(
+            np.array([1.0, 0.0, 0.0])
+        )
+        headings[valid] = np.degrees(np.arctan2(forward[:, 0], forward[:, 1])) % 360.0
+    return headings
+
+
+def plot_sync_diagnostics(data_dir, output_dir):
+    gps_path = Path(data_dir) / "gps_raw.csv"
+    quat_path = Path(data_dir) / "imu_quat.csv"
+    if not gps_path.exists() or not quat_path.exists():
+        print("[INFO] Skip sync diagnostics: gps_raw.csv or imu_quat.csv missing.")
+        return
+
+    gps_raw = pd.read_csv(gps_path)
+    imu_quat = pd.read_csv(quat_path)
+    for col in ["wall_time", "heading_deg"]:
+        if col in gps_raw.columns:
+            gps_raw[col] = pd.to_numeric(gps_raw[col], errors="coerce")
+    for col in ["wall_time", "q1", "q2", "q3", "q4"]:
+        imu_quat[col] = pd.to_numeric(imu_quat[col], errors="coerce")
+
+    gps_hdt = gps_raw[gps_raw["msg_type"] == "HDT"].dropna(
+        subset=["wall_time", "heading_deg"]
+    )
+    imu_quat = imu_quat.dropna(subset=["wall_time", "q1", "q2", "q3", "q4"])
+    if len(gps_hdt) < 10 or len(imu_quat) < 10:
+        print("[INFO] Skip sync diagnostics: not enough heading samples.")
+        return
+
+    gps_t = gps_hdt["wall_time"].values.astype(float)
+    gps_heading = unwrap_heading_deg(gps_hdt["heading_deg"].values.astype(float))
+    imu_t = imu_quat["wall_time"].values.astype(float)
+    imu_heading = unwrap_heading_deg(_heading_from_quat_df(imu_quat))
+
+    valid_imu = np.isfinite(imu_heading)
+    imu_t = imu_t[valid_imu]
+    imu_heading = imu_heading[valid_imu]
+    if len(imu_t) < 10:
+        print("[INFO] Skip sync diagnostics: invalid IMU quaternion headings.")
+        return
+
+    lags = np.arange(-1.0, 1.0001, 0.01)
+    corr = np.full(len(lags), np.nan, dtype=float)
+    rmse = np.full(len(lags), np.nan, dtype=float)
+    offsets = np.full(len(lags), np.nan, dtype=float)
+    gps_rate = np.gradient(gps_heading, gps_t)
+
+    for i, lag in enumerate(lags):
+        target_t = gps_t + lag
+        in_range = (target_t >= imu_t[0]) & (target_t <= imu_t[-1])
+        if np.count_nonzero(in_range) < 10:
+            continue
+        imu_shift = np.interp(target_t[in_range], imu_t, imu_heading)
+        gps_shift = gps_heading[in_range]
+        offset = np.median(imu_shift - gps_shift)
+        offsets[i] = offset
+        rmse[i] = math.sqrt(float(np.mean((imu_shift - offset - gps_shift) ** 2)))
+        imu_rate = np.gradient(imu_shift, gps_t[in_range])
+        corr[i] = _pearson_corr(gps_rate[in_range], imu_rate)
+
+    if np.all(~np.isfinite(corr)):
+        print("[INFO] Skip sync diagnostics: no valid lag correlation.")
+        return
+
+    best_i = int(np.nanargmax(corr))
+    best_lag = float(lags[best_i])
+    best_corr = float(corr[best_i])
+    best_offset = float(offsets[best_i])
+    best_rmse = float(rmse[best_i])
+
+    target_t = gps_t + best_lag
+    in_range = (target_t >= imu_t[0]) & (target_t <= imu_t[-1])
+    imu_aligned = np.interp(target_t[in_range], imu_t, imu_heading) - best_offset
+    gps_aligned = gps_heading[in_range]
+    aligned_t = gps_t[in_range] - gps_t[0]
+
+    nearest_idx = np.searchsorted(imu_t, gps_t)
+    nearest_dt = np.full(len(gps_t), np.nan, dtype=float)
+    for i, idx in enumerate(nearest_idx):
+        candidates = []
+        if idx < len(imu_t):
+            candidates.append(idx)
+        if idx > 0:
+            candidates.append(idx - 1)
+        if candidates:
+            best = min(candidates, key=lambda k: abs(imu_t[k] - gps_t[i]))
+            nearest_dt[i] = imu_t[best] - gps_t[i]
+    nearest_dt_ms = nearest_dt * 1000.0
+    finite_nearest = nearest_dt_ms[np.isfinite(nearest_dt_ms)]
+    nearest_abs_ms = np.abs(finite_nearest)
+    nearest_mean_ms = float(np.mean(finite_nearest)) if len(finite_nearest) else np.nan
+    nearest_median_abs_ms = float(np.median(nearest_abs_ms)) if len(nearest_abs_ms) else np.nan
+    nearest_max_abs_ms = float(np.max(nearest_abs_ms)) if len(nearest_abs_ms) else np.nan
+    nearest_p95_abs_ms = float(np.percentile(nearest_abs_ms, 95)) if len(nearest_abs_ms) else np.nan
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
+    _safe_window_title(fig, "IMU/GPS Sync Diagnostics")
+    axes[0].plot(gps_t - gps_t[0], gps_heading, ".", markersize=3,
+                 label="GPS HDT heading")
+    axes[0].plot(imu_t - gps_t[0], imu_heading, ".", markersize=1,
+                 alpha=0.45, label="IMU quaternion heading")
+    axes[0].set_ylabel("Unwrapped heading (deg)")
+    axes[0].set_title("Raw Heading Series")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(aligned_t, gps_aligned, ".", markersize=3,
+                 label="GPS HDT")
+    axes[1].plot(aligned_t, imu_aligned, ".", markersize=2,
+                 label=f"IMU shifted {best_lag:+.2f}s, offset {best_offset:+.1f}deg")
+    axes[1].set_ylabel("Aligned heading (deg)")
+    axes[1].set_title(f"Best Alignment: corr={best_corr:.3f}, RMSE={best_rmse:.2f} deg")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    axes[2].plot(gps_t - gps_t[0], nearest_dt_ms, ".", markersize=3,
+                 label="nearest IMU time - GPS time")
+    axes[2].axhline(0.0, color="black", linewidth=0.8)
+    axes[2].axhline(1.25, color="red", linestyle="--", linewidth=0.9,
+                    label="+/- 1.25 ms for 400 Hz IMU")
+    axes[2].axhline(-1.25, color="red", linestyle="--", linewidth=0.9)
+    axes[2].set_xlabel("GPS time since start (s)")
+    axes[2].set_ylabel("Nearest IMU dt (ms)")
+    axes[2].set_title(
+        "GPS Timestamp Coverage by Nearest IMU Sample "
+        f"(median |dt|={nearest_median_abs_ms:.3f} ms, "
+        f"max |dt|={nearest_max_abs_ms:.3f} ms)"
+    )
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
+    plt.tight_layout()
+    fig.savefig(output_dir / "6_sync_heading_lag_diagnostics.png", dpi=150,
+                bbox_inches="tight")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _safe_window_title(fig, "GPS Timestamp Coverage Histogram")
+    if len(nearest_abs_ms):
+        bins = np.linspace(0.0, max(3.0, nearest_max_abs_ms), 40)
+        ax.hist(nearest_abs_ms, bins=bins, color="steelblue",
+                edgecolor="black", alpha=0.75)
+        ax.axvline(1.25, color="red", linestyle="--",
+                   label="1.25 ms = half period at 400 Hz")
+        ax.axvline(nearest_median_abs_ms, color="darkorange", linestyle="-",
+                   label=f"median {nearest_median_abs_ms:.3f} ms")
+        ax.axvline(nearest_p95_abs_ms, color="purple", linestyle=":",
+                   label=f"p95 {nearest_p95_abs_ms:.3f} ms")
+    ax.set_xlabel("|nearest IMU time - GPS time| (ms)")
+    ax.set_ylabel("GPS sample count")
+    ax.set_title("GPS Timestamp Coverage by Nearest IMU Sample")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    fig.savefig(output_dir / "7_gps_to_nearest_imu_dt_histogram.png",
+                dpi=150, bbox_inches="tight")
+
+    summary_path = output_dir / "sync_diagnostics.csv"
+    with summary_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "best_lag_s",
+            "heading_rate_corr",
+            "imu_minus_gps_heading_offset_deg",
+            "aligned_heading_rmse_deg",
+            "nearest_imu_minus_gps_mean_ms",
+            "nearest_abs_dt_median_ms",
+            "nearest_abs_dt_p95_ms",
+            "nearest_abs_dt_max_ms",
+            "gps_samples",
+            "imu_samples",
+        ])
+        writer.writerow([
+            f"{best_lag:.4f}",
+            f"{best_corr:.6f}",
+            f"{best_offset:.6f}",
+            f"{best_rmse:.6f}",
+            f"{nearest_mean_ms:.6f}",
+            f"{nearest_median_abs_ms:.6f}",
+            f"{nearest_p95_abs_ms:.6f}",
+            f"{nearest_max_abs_ms:.6f}",
+            len(gps_t),
+            len(imu_t),
+        ])
+    print(
+        "Sync diagnostics: "
+        f"best lag={best_lag:+.3f}s, corr={best_corr:.3f}, "
+        f"heading offset={best_offset:+.2f}deg, RMSE={best_rmse:.2f}deg, "
+        f"nearest IMU |dt| median={nearest_median_abs_ms:.3f}ms, "
+        f"max={nearest_max_abs_ms:.3f}ms"
+    )
 
 
 def load_heading_series_for_plot(data_dir, keyframes):
@@ -783,7 +1110,7 @@ def load_heading_series_for_plot(data_dir, keyframes):
     return gps_headings, imu_headings
 
 
-def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
+def plot_results(x, keyframes, imu_rate_rows, output_dir, ref_lat, ref_lon,
                  ref_alt, data_dir):
     fg_lats = []
     fg_lons = []
@@ -804,13 +1131,13 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
         times.append(kf["t"] - keyframes[0]["t"])
         speeds.append(math.hypot(state[3], state[4]))
 
-    interp_lats = [row["lat"] for row in interp_rows]
-    interp_lons = [row["lon"] for row in interp_rows]
-    interp_times = [row["wall_time"] - keyframes[0]["t"] for row in interp_rows]
-    interp_speeds = [math.hypot(row["ve"], row["vn"]) for row in interp_rows]
-    interp_enu = np.array([
+    imu_rate_lats = [row["lat"] for row in imu_rate_rows]
+    imu_rate_lons = [row["lon"] for row in imu_rate_rows]
+    imu_rate_times = [row["wall_time"] - keyframes[0]["t"] for row in imu_rate_rows]
+    imu_rate_speeds = [math.hypot(row["ve"], row["vn"]) for row in imu_rate_rows]
+    imu_rate_enu = np.array([
         gps_to_enu(row["lat"], row["lon"], row["alt"], ref_lat, ref_lon, ref_alt)
-        for row in interp_rows
+        for row in imu_rate_rows
     ])
     fg_enu = np.array([
         gps_to_enu(lat, lon, alt, ref_lat, ref_lon, ref_alt)
@@ -822,19 +1149,19 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     ])
 
     fig, ax = plt.subplots(figsize=(12, 10))
-    fig.canvas.manager.set_window_title("Factor Graph Trajectory")
+    _safe_window_title(fig, "Factor Graph Trajectory")
     ax.plot(gps_lons, gps_lats, "b.", markersize=4, label="GPS/reference")
-    ax.plot(interp_lons, interp_lats, ".", color="seagreen", markersize=1.2,
-            alpha=0.6, label="Factor graph interpolated")
+    ax.plot(imu_rate_lons, imu_rate_lats, ".", color="seagreen", markersize=1.2,
+            alpha=0.6, label="GPS+IMU fused IMU-rate points")
     ax.plot(fg_lons, fg_lats, "o", color="darkorange", markersize=3,
-            label="Factor graph keyframes")
+            label="GPS+IMU fused keyframes")
     ax.scatter(gps_lons[0], gps_lats[0], c="green", s=80, marker="^",
                label="Start", zorder=5)
     ax.scatter(gps_lons[-1], gps_lats[-1], c="red", s=80, marker="s",
                label="End", zorder=5)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title("Factor Graph GPS/IMU Trajectory with Interpolated Points")
+    ax.set_title("GPS+IMU Fused Trajectory: Real IMU-Rate Points Between GPS")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -844,11 +1171,11 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
                 bbox_inches="tight")
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    fig.canvas.manager.set_window_title("Factor Graph Speed")
-    ax.plot(interp_times, interp_speeds, ".", color="seagreen", markersize=1.2,
-            alpha=0.6, label="Interpolated")
+    _safe_window_title(fig, "Factor Graph Speed")
+    ax.plot(imu_rate_times, imu_rate_speeds, ".", color="seagreen", markersize=1.2,
+            alpha=0.6, label="GPS+IMU fused IMU-rate points")
     ax.plot(times, speeds, "o", color="darkorange", markersize=3,
-            label="Keyframes")
+            label="GPS+IMU fused keyframes")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Speed (m/s)")
     ax.set_title("Factor Graph Speed")
@@ -860,13 +1187,13 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
 
     # ENU top-view in meters.
     fig, ax = plt.subplots(figsize=(12, 10))
-    fig.canvas.manager.set_window_title("Factor Graph ENU Top View")
+    _safe_window_title(fig, "Factor Graph ENU Top View")
     ax.plot(gps_enu[:, 0], gps_enu[:, 1], "b.", markersize=4,
             label="GPS/reference keyframes")
-    ax.plot(interp_enu[:, 0], interp_enu[:, 1], ".", color="seagreen",
-            markersize=1.2, alpha=0.6, label="Factor graph interpolated")
+    ax.plot(imu_rate_enu[:, 0], imu_rate_enu[:, 1], ".", color="seagreen",
+            markersize=1.2, alpha=0.6, label="GPS+IMU fused IMU-rate points")
     ax.plot(fg_enu[:, 0], fg_enu[:, 1], "o", color="darkorange",
-            markersize=3, label="Factor graph keyframes")
+            markersize=3, label="GPS+IMU fused keyframes")
     ax.scatter(gps_enu[0, 0], gps_enu[0, 1], c="green", s=80,
                marker="^", zorder=5, label="Start")
     ax.scatter(gps_enu[-1, 0], gps_enu[-1, 1], c="red", s=80,
@@ -883,15 +1210,15 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
 
     # 3D point view in meters.
     fig = plt.figure(figsize=(12, 9))
-    fig.canvas.manager.set_window_title("Factor Graph 3D ENU")
+    _safe_window_title(fig, "Factor Graph 3D ENU")
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(gps_enu[:, 0], gps_enu[:, 1], gps_enu[:, 2],
                c="blue", s=8, label="GPS/reference keyframes")
-    ax.scatter(interp_enu[:, 0], interp_enu[:, 1], interp_enu[:, 2],
+    ax.scatter(imu_rate_enu[:, 0], imu_rate_enu[:, 1], imu_rate_enu[:, 2],
                c="seagreen", s=2, alpha=0.55,
-               label="Factor graph interpolated")
+               label="GPS+IMU fused IMU-rate points")
     ax.scatter(fg_enu[:, 0], fg_enu[:, 1], fg_enu[:, 2],
-               c="darkorange", s=10, label="Factor graph keyframes")
+               c="darkorange", s=10, label="GPS+IMU fused keyframes")
     ax.set_xlabel("East (m)")
     ax.set_ylabel("North (m)")
     ax.set_zlabel("Up (m)")
@@ -904,7 +1231,7 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     # IMU heading vs GPS/reference heading.
     gps_hdg, imu_hdg = load_heading_series_for_plot(data_dir, keyframes)
     fig, ax = plt.subplots(figsize=(12, 5))
-    fig.canvas.manager.set_window_title("IMU Heading vs GPS Heading")
+    _safe_window_title(fig, "IMU Heading vs GPS Heading")
     if imu_hdg:
         imu_t = [m["t"] - keyframes[0]["t"] for m in imu_hdg]
         imu_heading_unwrapped = unwrap_heading_deg(
@@ -930,6 +1257,8 @@ def plot_results(x, keyframes, interp_rows, output_dir, ref_lat, ref_lon,
     plt.tight_layout()
     fig.savefig(output_dir / "5_heading_imu_vs_gps.png", dpi=150,
                 bbox_inches="tight")
+
+    plot_sync_diagnostics(data_dir, output_dir)
 
 
 def main():
@@ -1000,11 +1329,11 @@ def main():
     print(f"Message:       {result.message}")
 
     save_results(result.x, keyframes, output_dir, ref_lat, ref_lon, ref_alt)
-    interp_rows = build_interpolated_results(
-        result.x, keyframes, ref_lat, ref_lon, ref_alt)
-    save_interpolated_results(interp_rows, output_dir)
+    imu_rate_rows = build_imu_rate_results(
+        result.x, keyframes, imu, ref_lat, ref_lon, ref_alt)
+    save_imu_rate_results(imu_rate_rows, output_dir)
     plot_results(
-        result.x, keyframes, interp_rows, output_dir,
+        result.x, keyframes, imu_rate_rows, output_dir,
         ref_lat, ref_lon, ref_alt, data_dir)
 
     print("=" * 60)
