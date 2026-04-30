@@ -1,16 +1,16 @@
 Recording Session Info
 ======================
-Start time:     2026-04-28 14:46:38
-Start epoch:    1777401998.841636
+Start time:     2026-04-30 15:01:51
+Start epoch:    1777575711.704990
 OS:             Windows
-IMU port:       COM12
+IMU port:       COM7
 IMU baud:       115200
-GPS port:       COM5
+GPS port:       COM10
 GPS baud:       115200
 IMU enabled:    True
 GPS enabled:    True
 Duration:       unlimited
-Output dir:     d:\ryan\github\paper\pavement_scanning_cam_array\pavement_scanning_cam_array\test_code\recording_code
+Output dir:     C:\Users\rqy19\Documents\github\Pavement_Scanning_Cam_Array\test_code\recording_code
 Serial buffer:  65536 bytes
 Event queue:    100000 slots (blocking put)
 
@@ -20,6 +20,8 @@ Time synchronization:
   gps_utc:          UTC from NMEA sentences (epoch or time-of-day)
   gps_utc_type:     'epoch' = full datetime, 'tod' = seconds since midnight
   Alignment method: use wall_time to correlate IMU and GPS clocks offline
+  gps_raw crossref: nearest IMU wall_time/timestamp recorded per GPS sentence
+  RMC clock model:  online GPS UTC = scale * wall_time + intercept when RMC exists
 
 IMU: SYD Dynamics TransducerM TM151
   Protocol: EasyProfile binary with CRC-16/MODBUS
@@ -46,38 +48,57 @@ Output files:
 
 Recording Complete
 ==================
-End time:       2026-04-28 14:46:49
-Duration:       10.8 seconds
+End time:       2026-04-30 15:03:13
+Duration:       81.7 seconds
 
 IMU CRC:
-  CRC pass:     0
+  CRC pass:     196611
   CRC fail:     0
+  CRC rate:     100.00%
 
 IMU RAW Logger:
-  Rows written: 0
+  Rows written: 32768
   Rows dropped: 0
-  Rate:         0.0 rows/s
+  Rate:         401.3 rows/s
 
 IMU QUAT Logger:
-  Rows written: 0
+  Rows written: 32768
   Rows dropped: 0
 
 IMU RPY Logger:
-  Rows written: 0
+  Rows written: 32768
   Rows dropped: 0
 
 IMU GRAVITY Logger:
-  Rows written: 0
+  Rows written: 32768
   Rows dropped: 0
 
 GPS Logger:
-  Rows written: 362
+  Rows written: 2560
   Rows dropped: 0
-  Rate:         33.4 rows/s
+  Rate:         31.4 rows/s
+
+IMU Reader Thread:
+  Packets read:   131074
+  Packets queued: 131074
+  Packets lost:   0
 
 GPS Reader Thread:
-  Lines read:     363
-  Lines queued:   363
+  Lines read:     2560
+  Lines queued:   2560
   Lines lost:     0
+
+GPS UTC <-> Wall Clock Calibration:
+  RMC samples:    0
+  Updates:        0
+  Offset s:       unavailable
+  Drift ppm:      unavailable
+
+GPS Arrival Jitter:
+  GGA:
+    samples:             825
+    nominal interval ms: 99.770
+    jitter std ms:       73.932
+    jitter max ms:       263.110
 
 ★ RECORDING COMPLETE — ZERO DROPS, ZERO CRC ERRORS ★

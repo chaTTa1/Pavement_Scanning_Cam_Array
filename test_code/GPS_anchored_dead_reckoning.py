@@ -608,7 +608,7 @@ class AsyncCSVLogger:
 
 # ─── Create loggers ───
 
-pos_logger = AsyncCSVLogger("position.csv", [
+pos_logger = AsyncCSVLogger("position_gpsanchor.csv", [
     "time", "source", "lat", "lon", "alt",
     "ve", "vn", "vu",
     "yaw", "pitch", "roll",
