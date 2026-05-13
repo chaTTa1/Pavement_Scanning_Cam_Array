@@ -45,6 +45,12 @@ static constexpr uint32_t USB_BAUD  = 115200;
 static constexpr uint32_t GNSS_BAUD = 115200;
 static constexpr uint32_t IMU_BAUD  = 115200;
 
+// Set true when you want to capture the generated MIP stream from the
+// Teensy's USB COM port on Windows. USB status text is disabled in this mode
+// so the capture remains a clean binary MIP file.
+static constexpr bool MIRROR_MIP_TO_USB = true;
+static constexpr bool PRINT_STATUS_TO_USB = !MIRROR_MIP_TO_USB;
+
 // Larger Serial1 RX buffer to absorb SBF bursts at 10+ Hz
 static uint8_t serial1_rx_buf[4096];
 
@@ -178,6 +184,9 @@ static bool send_mip_packet(uint8_t desc_set, const MipField* fields, uint8_t n_
     pkt[idx++] = c1;
 
     Serial2.write(pkt, idx);
+    if (MIRROR_MIP_TO_USB) {
+        Serial.write(pkt, idx);
+    }
     return true;
 }
 
@@ -547,12 +556,14 @@ void setup() {
     uint32_t t0 = millis();
     while (!Serial && (millis() - t0) < 3000) {}
 
-    Serial.println();
-    Serial.println(F("================================================"));
-    Serial.println(F(" Teensy 4.1  SBF -> MIP Bridge"));
-    Serial.println(F(" Serial1 (Pin 0): simpleRTK3B SBF @ 115200"));
-    Serial.println(F(" Serial2 (Pin 8): CV7-INS MIP    @ 115200"));
-    Serial.println(F("================================================"));
+    if (PRINT_STATUS_TO_USB) {
+        Serial.println();
+        Serial.println(F("================================================"));
+        Serial.println(F(" Teensy 4.1  SBF -> MIP Bridge"));
+        Serial.println(F(" Serial1 (Pin 0): simpleRTK3B SBF @ 115200"));
+        Serial.println(F(" Serial2 (Pin 8): CV7-INS MIP    @ 115200"));
+        Serial.println(F("================================================"));
+    }
 
     last_status_ms = millis();
 }
@@ -566,7 +577,7 @@ void loop() {
     }
 
     // 1 Hz status to USB
-    if (millis() - last_status_ms >= 1000) {
+    if (PRINT_STATUS_TO_USB && millis() - last_status_ms >= 1000) {
         last_status_ms = millis();
         print_status();
     }
