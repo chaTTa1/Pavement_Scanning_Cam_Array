@@ -1,0 +1,4 @@
+use powershell to load bin file and give to SDK to validate if recorded MIP are correct
+cd .\MIP_SDK_version\MIP_sdk_version\test_recording
+powershell -ExecutionPolicy Bypass -File .\record_mip.ps1 -Port COM12 -Baud 115200 -Duration 10 -OutPrefix mip_test_01
+

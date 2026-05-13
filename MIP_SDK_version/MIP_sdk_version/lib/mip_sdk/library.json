@@ -1,0 +1,33 @@
+{
+  "name": "mip_sdk",
+  "version": "3.0.0",
+  "description": "MicroStrain MIP Communication SDK (C core)",
+  "keywords": "mip, microstrain, cv7, ins, imu",
+  "license": "MIT",
+  "frameworks": "arduino",
+  "platforms": "teensy",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src",
+    "flags": [
+      "-Isrc",
+      "-Wno-unused-function",
+      "-Wno-unused-variable",
+      "-Wno-unused-parameter",
+      "-Wno-missing-field-initializers",
+      "-Wno-sign-compare",
+      "-Wno-implicit-fallthrough",
+      "-DMICROSTRAIN_PLATFORM_EMBEDDED=1",
+      "-DMIP_USE_EXTRAS=0",
+      "-DMIP_DISABLE_CPP=1"
+    ],
+    "srcFilter": [
+      "+<microstrain/**/*.c>",
+      "+<mip/**/*.c>",
+      "-<**/connections/**>",
+      "-<**/extras/**>",
+      "-<**/*_test*>",
+      "-<**/*_Test*>"
+    ]
+  }
+}

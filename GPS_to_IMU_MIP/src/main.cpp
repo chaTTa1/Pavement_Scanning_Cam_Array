@@ -20,17 +20,17 @@
  *     AttEuler      (5938)    heading + pitch + roll  (Heading board only)
  *     AttCovEuler   (5939)    attitude covariance
  *
- * MIP outputs to CV7-INS (External Aiding, descriptor set 0x13):
- *   0x62 External GNSS Time   (12 bytes payload)
- *   0x16 External Position LLH(48 bytes payload)
- *   0x17 External Velocity NED(36 bytes payload)
- *   0x28 External Heading True(20 bytes payload, only when Heading is valid)
+ * MIP outputs to CV7-INS (Aiding command descriptor set 0x13):
+ *   0x22 LLH Position         (49 bytes payload)
+ *   0x29 NED Velocity         (37 bytes payload)
+ *   0x31 True Heading         (19 bytes payload, only when Heading is valid)
  *
  * Notes:
  *   - All MIP fields use BIG-endian byte order (manual byte swapping required)
  *   - SBF fields are LITTLE-endian (matches Teensy native order, direct memcpy ok)
  *   - "Do-Not-Use" sentinel values in SBF (-2e10 / -2e9) are detected and skipped
- *   - One MIP packet per GPS epoch (deduplicated by TOW)
+ *   - One position and one velocity command per GPS epoch (deduplicated by TOW)
+ *     plus one heading command when heading is valid
  */
 
 #include <Arduino.h>
@@ -51,6 +51,18 @@ static constexpr uint32_t IMU_BAUD  = 115200;
 static constexpr bool MIRROR_MIP_TO_USB = true;
 static constexpr bool PRINT_STATUS_TO_USB = !MIRROR_MIP_TO_USB;
 
+// CV7/GV7 SDK "mip_time" format used by Aiding commands:
+//   timebase u8, reserved u8 (=1), nanoseconds u64.
+// TIME_OF_ARRIVAL makes the measurement timestamp relative to message arrival,
+// which is the safest default unless the CV7 is synced to the GNSS PPS/external
+// clock. If PPS/external-time sync is configured, switch to EXTERNAL_TIME and
+// enable GPS nanoseconds below.
+static constexpr uint8_t AIDING_TIMEBASE_EXTERNAL_TIME   = 2;
+static constexpr uint8_t AIDING_TIMEBASE_TIME_OF_ARRIVAL = 3;
+static constexpr uint8_t AIDING_TIMEBASE = AIDING_TIMEBASE_TIME_OF_ARRIVAL;
+static constexpr bool    USE_GPS_TIME_NANOSECONDS = false;
+static constexpr uint8_t AIDING_FRAME_ID = 1;
+
 // Larger Serial1 RX buffer to absorb SBF bursts at 10+ Hz
 static uint8_t serial1_rx_buf[4096];
 
@@ -61,10 +73,9 @@ static constexpr uint8_t MIP_SYNC1 = 0x75;
 static constexpr uint8_t MIP_SYNC2 = 0x65;
 
 static constexpr uint8_t DESC_SET_AIDING       = 0x13;
-static constexpr uint8_t FIELD_EXT_POS_LLH     = 0x16;
-static constexpr uint8_t FIELD_EXT_VEL_NED     = 0x17;
-static constexpr uint8_t FIELD_EXT_HEADING_TRUE= 0x28;
-static constexpr uint8_t FIELD_EXT_GNSS_TIME   = 0x62;
+static constexpr uint8_t FIELD_AIDING_POS_LLH  = 0x22;
+static constexpr uint8_t FIELD_AIDING_VEL_NED  = 0x29;
+static constexpr uint8_t FIELD_AIDING_HEADING_TRUE = 0x31;
 
 // Fletcher-16 over (sync-stripped) header + payload
 static void fletcher16(const uint8_t* data, size_t len, uint8_t& c0, uint8_t& c1) {
@@ -93,62 +104,71 @@ static inline void put_be64d(uint8_t* p, double v) {
     uint64_t u; memcpy(&u, &v, 8); put_be64(p, u);
 }
 
-// 0x13, 0x62  External GNSS Time (12 bytes)
-static size_t pack_ext_gnss_time(uint8_t* buf, double tow_s, uint16_t week,
-                                 uint16_t valid_flags = 0x0003) {
-    put_be64d(buf + 0,  tow_s);
-    put_be16 (buf + 8,  week);
-    put_be16 (buf + 10, valid_flags);
-    return 12;
+static uint64_t gps_time_ns(uint16_t week, uint32_t tow_ms) {
+    static constexpr uint64_t NS_PER_MS = 1000000ULL;
+    static constexpr uint64_t NS_PER_WEEK = 604800000000000ULL;
+    return ((uint64_t)week * NS_PER_WEEK) + ((uint64_t)tow_ms * NS_PER_MS);
 }
 
-// 0x13, 0x16  External Position LLH (48 bytes)
-static size_t pack_ext_pos_llh(uint8_t* buf,
-                               double tow_s, uint16_t week,
-                               double lat_deg, double lon_deg, double height_m,
-                               float unc_n, float unc_e, float unc_d,
-                               uint16_t valid_flags = 0x000F) {
-    put_be64d(buf + 0,  tow_s);
-    put_be16 (buf + 8,  week);
-    put_be64d(buf + 10, lat_deg);
-    put_be64d(buf + 18, lon_deg);
-    put_be64d(buf + 26, height_m);
-    put_be32f(buf + 34, unc_n);
-    put_be32f(buf + 38, unc_e);
-    put_be32f(buf + 42, unc_d);
-    put_be16 (buf + 46, valid_flags);
-    return 48;
+static size_t pack_aiding_time(uint8_t* buf, uint16_t week, uint32_t tow_ms) {
+    buf[0] = AIDING_TIMEBASE;
+    buf[1] = 0x01;  // reserved
+    put_be64(buf + 2, USE_GPS_TIME_NANOSECONDS ? gps_time_ns(week, tow_ms) : 0ULL);
+    return 10;
 }
 
-// 0x13, 0x17  External Velocity NED (36 bytes)
-static size_t pack_ext_vel_ned(uint8_t* buf,
-                               double tow_s, uint16_t week,
-                               float vn, float ve, float vd,
-                               float unc_n, float unc_e, float unc_d,
-                               uint16_t valid_flags = 0x0007) {
-    put_be64d(buf + 0,  tow_s);
-    put_be16 (buf + 8,  week);
-    put_be32f(buf + 10, vn);
-    put_be32f(buf + 14, ve);
-    put_be32f(buf + 18, vd);
-    put_be32f(buf + 22, unc_n);
-    put_be32f(buf + 26, unc_e);
-    put_be32f(buf + 30, unc_d);
-    put_be16 (buf + 34, valid_flags);
-    return 36;
+// 0x13, 0x22  LLH Position aiding command (49 bytes)
+static size_t pack_aiding_pos_llh(uint8_t* buf,
+                                  uint32_t tow_ms, uint16_t week,
+                                  double lat_deg, double lon_deg, double height_m,
+                                  float unc_n, float unc_e, float unc_d,
+                                  uint16_t valid_flags = 0x0007) {
+    size_t idx = pack_aiding_time(buf, week, tow_ms);
+    buf[idx++] = AIDING_FRAME_ID;
+    put_be64d(buf + idx, lat_deg);    idx += 8;
+    put_be64d(buf + idx, lon_deg);    idx += 8;
+    put_be64d(buf + idx, height_m);   idx += 8;
+    put_be32f(buf + idx, unc_n);      idx += 4;
+    put_be32f(buf + idx, unc_e);      idx += 4;
+    put_be32f(buf + idx, unc_d);      idx += 4;
+    put_be16 (buf + idx, valid_flags);idx += 2;
+    return idx;
 }
 
-// 0x13, 0x28  External Heading True (20 bytes)
-static size_t pack_ext_heading_true(uint8_t* buf,
-                                    double tow_s, uint16_t week,
-                                    float heading_deg, float heading_unc_deg,
-                                    uint16_t valid_flags = 0x0003) {
-    put_be64d(buf + 0,  tow_s);
-    put_be16 (buf + 8,  week);
-    put_be32f(buf + 10, heading_deg);
-    put_be32f(buf + 14, heading_unc_deg);
-    put_be16 (buf + 18, valid_flags);
-    return 20;
+// 0x13, 0x29  NED Velocity aiding command (37 bytes)
+static size_t pack_aiding_vel_ned(uint8_t* buf,
+                                  uint32_t tow_ms, uint16_t week,
+                                  float vn, float ve, float vd,
+                                  float unc_n, float unc_e, float unc_d,
+                                  uint16_t valid_flags = 0x0007) {
+    size_t idx = pack_aiding_time(buf, week, tow_ms);
+    buf[idx++] = AIDING_FRAME_ID;
+    put_be32f(buf + idx, vn);         idx += 4;
+    put_be32f(buf + idx, ve);         idx += 4;
+    put_be32f(buf + idx, vd);         idx += 4;
+    put_be32f(buf + idx, unc_n);      idx += 4;
+    put_be32f(buf + idx, unc_e);      idx += 4;
+    put_be32f(buf + idx, unc_d);      idx += 4;
+    put_be16 (buf + idx, valid_flags);idx += 2;
+    return idx;
+}
+
+// 0x13, 0x31  True Heading aiding command (19 bytes)
+static size_t pack_aiding_heading_true(uint8_t* buf,
+                                       uint32_t tow_ms, uint16_t week,
+                                       float heading_deg, float heading_unc_deg,
+                                       uint16_t valid_flags = 0x0001) {
+    static constexpr float DEG_TO_RAD = (float)(M_PI / 180.0);
+    float heading_rad = heading_deg * DEG_TO_RAD;
+    while (heading_rad > (float)M_PI) heading_rad -= (float)(2.0 * M_PI);
+    while (heading_rad < (float)-M_PI) heading_rad += (float)(2.0 * M_PI);
+
+    size_t idx = pack_aiding_time(buf, week, tow_ms);
+    buf[idx++] = AIDING_FRAME_ID;
+    put_be32f(buf + idx, heading_rad);                 idx += 4;
+    put_be32f(buf + idx, heading_unc_deg * DEG_TO_RAD);idx += 4;
+    put_be16 (buf + idx, valid_flags);                 idx += 2;
+    return idx;
 }
 
 // Build & send a MIP packet with multiple fields on Serial2
@@ -361,44 +381,36 @@ static void try_send_mip() {
     if (pvt.tow_ms == last_mip_tow) return;
     last_mip_tow = pvt.tow_ms;
 
-    double tow_s = pvt.tow_ms * 1e-3;
-
-    MipField fields[4];
-    uint8_t  nf = 0;
-
-    // Time
-    fields[nf].desc = FIELD_EXT_GNSS_TIME;
-    fields[nf].len  = (uint8_t)pack_ext_gnss_time(fields[nf].data, tow_s, pvt.week);
-    nf++;
+    MipField field;
 
     // Position
-    fields[nf].desc = FIELD_EXT_POS_LLH;
-    fields[nf].len  = (uint8_t)pack_ext_pos_llh(fields[nf].data,
-                                                tow_s, pvt.week,
-                                                pvt.lat_deg, pvt.lon_deg, pvt.h_m,
-                                                pcv.std_n, pcv.std_e, pcv.std_u);
-    nf++;
+    field.desc = FIELD_AIDING_POS_LLH;
+    field.len  = (uint8_t)pack_aiding_pos_llh(field.data,
+                                              pvt.tow_ms, pvt.week,
+                                              pvt.lat_deg, pvt.lon_deg, pvt.h_m,
+                                              pcv.std_n, pcv.std_e, pcv.std_u);
+    send_mip_packet(DESC_SET_AIDING, &field, 1);
+    mip_total++;
 
     // Velocity (NED: D = -U)
-    fields[nf].desc = FIELD_EXT_VEL_NED;
-    fields[nf].len  = (uint8_t)pack_ext_vel_ned(fields[nf].data,
-                                                tow_s, pvt.week,
-                                                pvt.vn, pvt.ve, -pvt.vu,
-                                                vcv.std_vn, vcv.std_ve, vcv.std_vu);
-    nf++;
+    field.desc = FIELD_AIDING_VEL_NED;
+    field.len  = (uint8_t)pack_aiding_vel_ned(field.data,
+                                              pvt.tow_ms, pvt.week,
+                                              pvt.vn, pvt.ve, -pvt.vu,
+                                              vcv.std_vn, vcv.std_ve, vcv.std_vu);
+    send_mip_packet(DESC_SET_AIDING, &field, 1);
+    mip_total++;
 
     // Heading (only if valid + same epoch)
     if (att.valid && acv.valid && att.tow_ms == pvt.tow_ms) {
-        fields[nf].desc = FIELD_EXT_HEADING_TRUE;
-        fields[nf].len  = (uint8_t)pack_ext_heading_true(fields[nf].data,
-                                                         tow_s, pvt.week,
-                                                         att.heading_deg,
-                                                         acv.std_heading);
-        nf++;
+        field.desc = FIELD_AIDING_HEADING_TRUE;
+        field.len  = (uint8_t)pack_aiding_heading_true(field.data,
+                                                       pvt.tow_ms, pvt.week,
+                                                       att.heading_deg,
+                                                       acv.std_heading);
+        send_mip_packet(DESC_SET_AIDING, &field, 1);
+        mip_total++;
     }
-
-    send_mip_packet(DESC_SET_AIDING, fields, nf);
-    mip_total++;
 }
 
 static void handle_sbf_packet(uint16_t blk_id, const uint8_t* blk, uint16_t len) {
