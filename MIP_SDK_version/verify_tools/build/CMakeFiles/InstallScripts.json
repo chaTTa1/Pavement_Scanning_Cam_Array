@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/cmake_install.cmake",
+		"C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-build/cmake_install.cmake",
+		"C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-build/src/c/microstrain/cmake_install.cmake",
+		"C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-build/src/c/microstrain/connections/cmake_install.cmake",
+		"C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-build/src/c/mip/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/mip_sdk-populate"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/37ac2a3b473a2c7472f68ebd263eba14/mip_sdk-populate.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/426d486f8e6716b96e84d21caa960962/mip_sdk-populate-complete.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-build.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-configure.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-download.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-install.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-mkdir.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-patch.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-test.rule"
+		},
+		{
+			"file" : "C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/cb76a7569fd685c9947d90646a0e5372/mip_sdk-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"mip_sdk-populate"
+		],
+		"name" : "mip_sdk-populate"
+	}
+}
