@@ -1,6 +1,6 @@
 # GPS to IMU MIP Bridge
 
-This PlatformIO project runs on a Teensy 4.1 and converts Septentrio SBF messages from a simpleRTK3B Heading / Mosaic-X5 receiver into MicroStrain MIP External Aiding packets for a CV7-INS.
+This PlatformIO project runs on a Teensy 4.1 and converts Septentrio SBF messages from a simpleRTK3B Heading / Mosaic-H receiver into MicroStrain MIP External Aiding packets for a CV7-INS.
 
 The firmware entry point is [`src/main.cpp`](src/main.cpp).
 
@@ -55,23 +55,6 @@ The command form is:
 ```text
 sso, Stream1, COM1, PVTGeodetic+PosCovGeodetic+VelCovGeodetic+AttEuler+AttCovEuler+ReceiverStatus+QualityInd+NTRIPClientStatus, msec100
 ```
-
-Configure the PPS output with `spps`:
-
-```text
-spps, msec100, Low2High, 0.0, GPS, 60, 1.0
-```
-
-This PPS configuration means:
-
-- `msec100`: 10 Hz PPS output.
-- `Low2High`: trigger on the rising edge.
-- `0.0`: no cable delay compensation.
-- `GPS`: use GPS time as the time reference.
-- `60`: maximum synchronization age is 60 seconds.
-- `1.0`: PPS pulse width is 1.0 ms.
-
-The 1.0 ms pulse width follows the MicroStrain recommendation: the PPS pulse should be at least 100 us wide, and 1 ms or wider is recommended.
 
 After confirming the live output is correct, save the current receiver configuration to onboard boot storage:
 
