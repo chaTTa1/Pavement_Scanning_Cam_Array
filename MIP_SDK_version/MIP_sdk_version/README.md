@@ -15,9 +15,11 @@ All serial and PPS signals must use 3.3 V logic and share a common ground.
 | MIP UART RX | Pin 7, `Serial2 RX` | CV7-INS pin 5, `TxD` main UART | IMU to Teensy |
 | PPS input GPIO | Pin 2, `PPS_IN_PIN` | GNSS 1 Hz PPS output | GNSS to Teensy |
 | PPS output GPIO | Pin 3, `PPS_OUT_IMU_PIN` | CV7/GV7 PPS input | Teensy to IMU |
-| IMU power | Teensy 3.3 V | CV7-INS pin 3, `Vin` | Power |
 | Ground | Teensy GND | CV7-INS pin 8, `GND` | Common ground |
 | USB | Teensy USB | Host PC | programming / binary capture |
+| IMU USB | CV7/GV7 USB | Host PC | IMU power and data readout |
+
+The Teensy-to-IMU wiring is only `PPS`, `TX`, `RX`, and `GND`; do not power the IMU from the Teensy 3.3 V rail. The IMU is powered by its USB connection, which is also used for reading IMU data from the host PC.
 
 The simpleRTK3B IOREF switch should be set to 3.3 V. The code comment also assumes the simpleRTK3B XBee socket is used by a WiFi NTRIP Master on COM2 and that the receiver is powered independently by USB-C.
 
