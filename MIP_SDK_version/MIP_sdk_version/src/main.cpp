@@ -51,6 +51,9 @@ static constexpr bool PRINT_STATUS_TO_USB = !MIRROR_MIP_TO_USB;
 // Change these two pins to match your wiring.
 static constexpr uint8_t PPS_IN_PIN = 2;
 static constexpr uint8_t PPS_OUT_IMU_PIN = 3;
+// Teensy 4.1 built-in LED is on pin 13. It flashes once per GPS PPS rising edge.
+static constexpr uint8_t PPS_LED_PIN = 13;
+static constexpr uint32_t PPS_LED_FLASH_US = 200000;  // 200 ms, easy to see at 1 Hz.
 
 // GNSS antenna lever arm in IMU body frame [m]
 // Update with real measurement when mounting on vehicle
@@ -71,6 +74,8 @@ static uint8_t serial1_rx_buf[4096];
 
 static volatile uint32_t pps_count = 0;
 static volatile uint32_t last_pps_us = 0;
+static volatile bool pps_led_active = false;
+static volatile uint32_t pps_led_off_us = 0;
 
 // =========================================================================
 // SBF parser (same as before, unchanged)
@@ -114,9 +119,23 @@ static void pps_isr() {
     digitalWriteFast(PPS_OUT_IMU_PIN, level);
 
     if (level) {
+        const uint32_t now_us = micros();
         pps_count++;
-        last_pps_us = micros();
+        last_pps_us = now_us;
+        pps_led_off_us = now_us + PPS_LED_FLASH_US;
+        pps_led_active = true;
+        digitalWriteFast(PPS_LED_PIN, HIGH);
     }
+}
+
+static void service_pps_led() {
+    const uint32_t now_us = micros();
+    noInterrupts();
+    if (pps_led_active && (int32_t)(now_us - pps_led_off_us) >= 0) {
+        digitalWriteFast(PPS_LED_PIN, LOW);
+        pps_led_active = false;
+    }
+    interrupts();
 }
 
 struct PvtSnapshot {
@@ -591,7 +610,9 @@ void setup() {
 
     pinMode(PPS_IN_PIN, INPUT);
     pinMode(PPS_OUT_IMU_PIN, OUTPUT);
+    pinMode(PPS_LED_PIN, OUTPUT);
     digitalWriteFast(PPS_OUT_IMU_PIN, digitalReadFast(PPS_IN_PIN));
+    digitalWriteFast(PPS_LED_PIN, LOW);
     attachInterrupt(digitalPinToInterrupt(PPS_IN_PIN), pps_isr, CHANGE);
 
     uint32_t t0 = millis();
@@ -607,6 +628,8 @@ void setup() {
         Serial.print(PPS_IN_PIN);
         Serial.print(F(" -> Pin "));
         Serial.println(PPS_OUT_IMU_PIN);
+        Serial.print(F(" PPS LED        : Pin "));
+        Serial.println(PPS_LED_PIN);
         Serial.println(F("================================================"));
     }
 
@@ -659,6 +682,8 @@ void loop() {
 
     // Pump MIP SDK (handles any pending replies from CV7)
     mip_interface_update(&mip_dev, 0, false);
+
+    service_pps_led();
 
     if (PRINT_STATUS_TO_USB && millis() - last_status_ms >= 1000) {
         last_status_ms = millis();
