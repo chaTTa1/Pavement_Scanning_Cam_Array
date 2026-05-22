@@ -341,7 +341,10 @@ def cam_configuration(nodemap,
         return False
 
     result &= setAcquisitionMode(nodemap, AcquisitionModeName='Continuous')
-
+    disableExposureAuto(nodemap)
+    disableGainAuto(nodemap)
+    result &= setPixelFormat(nodemap)
+    result &= setResolution(nodemap)
     if frameRate is not None:
         result &= setFrameRate(nodemap, frameRate=frameRate)
 
@@ -902,7 +905,34 @@ def enableFrameRateSetting(nodemap):
 
     return True
 
+def setPixelFormat(nodemap):
+    pixel_format = PySpin.CEnumerationPtr(
+        nodemap.GetNode("PixelFormat")
+    )
 
+    mono8 = pixel_format.GetEntryByName("Mono8")
+
+    pixel_format.SetIntValue(mono8.GetValue())
+
+    print("PixelFormat set to Mono8")
+    return True
+def setResolution(nodemap):
+
+    width = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+    height = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+
+    offsetX = PySpin.CIntegerPtr(nodemap.GetNode("OffsetX"))
+    offsetY = PySpin.CIntegerPtr(nodemap.GetNode("OffsetY"))
+
+    # Must zero offsets before shrinking ROI
+    offsetX.SetValue(0)
+    offsetY.SetValue(0)
+
+    width.SetValue(720)
+    height.SetValue(540)
+
+    print("Resolution set to 720x540")
+    return True
 def setFrameRate(nodemap, frameRate):
     if not enableFrameRateSetting(nodemap):
         return False
@@ -1250,16 +1280,16 @@ def main():
     print("----------------------------------\n")
 
     try:
-        '''while pps < 1:
-            edge = GPIO.wait_for_edge(PPS_PIN, GPIO.RISING, timeout=1000)
-            if edge is None:
-                continue'''
+        #while pps < 1:
+         #   edge = GPIO.wait_for_edge(PPS_PIN, GPIO.RISING, timeout=1000)
+          #  if edge is None:
+           #     continue
 
         event_time = get_tow_from_utc()
-        '''print(f"[{event_time}] 🟢 PPS Trigger Received!")
+        #    print(f"[{event_time}] 🟢 PPS Trigger Received!")
 
-            time.sleep(0.1)
-            pps = 1'''
+         #   time.sleep(0.1)
+          #  pps = 1
 
     except KeyboardInterrupt:
         print("\nExiting...")
@@ -1295,8 +1325,8 @@ def main():
                                         triggerType=triggerType,
                                         cam_list=cam_list,
                                         system=system,
-                                        frameRate=200,
-                                        exposureTime=2000,
+                                        frameRate=435,
+                                        exposureTime=1000,
                                         gain=None,
                                         bufferCount=15,
                                         timeout=1000)
