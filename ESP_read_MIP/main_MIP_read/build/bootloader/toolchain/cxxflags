@@ -1,0 +1,7 @@
+"-specs=C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/ESP_read_MIP/main_MIP_read/build/bootloader/specs/picolibc.specs"
+-Wno-frame-address
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
+-fno-rtti
