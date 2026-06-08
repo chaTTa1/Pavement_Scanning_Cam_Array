@@ -8,7 +8,7 @@ Current data path:
 Septentrio mosaic-H -> Teensy 4.1 -> 3DM-CV7-INS -> Windows Python CSV
 ```
 
-The CV7 does not directly read the raw GPS stream in this setup. mosaic-H PVT, velocity, and attitude data first go to the Teensy. The Teensy then sends CV7 external aiding commands. Therefore `cv7_gps_raw_*.csv` is usually empty in this setup; that is expected. The fused EKF position is written to `cv7_ekf_fused_*.csv`.
+The CV7 does not directly read the raw GPS stream in this setup. mosaic-H PVT, velocity, and attitude data first go to the Teensy. The Teensy then sends CV7 external aiding commands. If `CV7_INS_EKF.py` is run with `--gps-port`, it also opens the GPS receiver's NMEA port and writes raw GPS rows to `cv7_gps_raw_*.csv`. The fused EKF position is written to `cv7_ekf_fused_*.csv`.
 
 ## Current Hardware Wiring
 
@@ -35,6 +35,55 @@ Notes:
 - The Teensy can be externally powered by the GPS setup and connected to USB for debugging at the same time, but all grounds must be common.
 - Do not power the CV7 from the Teensy 3.3 V pin.
 - If the left-side UART header on the C-Series board is used for TTL serial input into the CV7, keep the J4 jumper removed so the onboard RS232 transceiver does not drive or interfere with UUT_RX.
+
+## INS And GPS Installation Requirements
+
+The 3DM-CV7-INS output depends on the physical installation, not only on serial data. Before collecting data, verify these items.
+
+### CV7 INS mounting
+
+- Mount the CV7 rigidly to the vehicle/body. It should not move relative to the GPS antennas after calibration.
+- Define the intended vehicle/body frame. For pavement scanning, use a consistent convention such as X forward, Y right, Z down or the convention required by your post-processing.
+- Check the CV7 body axes against the vehicle frame. If the CV7 is rotated relative to the vehicle, set the installation/mounting transform in SensorConnect or in the device configuration before using EKF output as vehicle motion.
+- Avoid mounting the CV7 on a flexible plate, cable bundle, or vibrating loose bracket. Mechanical vibration or shifting causes the EKF to correct itself whenever GPS aiding arrives.
+- Keep the IMU location fixed and document the measurement reference point. The GNSS lever arm must be measured from this IMU/body reference.
+
+### GPS antenna placement
+
+- Place the GNSS antennas with clear sky view. Avoid roof edges, metal obstructions, nearby high-current cables, and camera/computer structures that can cause multipath.
+- For mosaic-H dual-antenna heading, both antennas must be rigidly mounted to the same vehicle body as the CV7.
+- The main-to-aux antenna baseline must be fixed and measured. Longer, cleaner baselines usually give more stable heading.
+- The heading produced by mosaic-H is the direction of the antenna baseline, not automatically the vehicle forward direction. If the antennas are mounted left-right, apply the correct heading offset before using it as CV7 external heading.
+- If heading is not valid in RxControl Attitude View, do not enable CV7 external heading as a trusted final heading source.
+
+### Lever arm and offsets
+
+- Measure the vector from the CV7 IMU reference point to the GNSS antenna phase center. Use the same body-frame convention as the CV7 installation.
+- If dual antennas are used, document both the main antenna lever arm and the main-to-aux baseline direction.
+- Configure the GNSS antenna offset/lever arm in the CV7 installation settings when available. An unconfigured lever arm can make turns look like periodic sideways corrections in the EKF trajectory.
+- Recheck the lever arm after moving antennas, changing roof mounts, or changing the CV7 mounting position.
+
+### Time synchronization
+
+- Feed the GPS 1 Hz PPS to CV7 GPIO1 through the Teensy path used in this project.
+- CV7 should be configured with `PPS Source = GPIO` and `GPIO1 = PPS Input`.
+- Teensy status should show `PPS rate: 1 /s`.
+- The POS/VEL/heading aiding messages sent by Teensy should use GPS time/TOW matching the original mosaic-H measurements. Time mismatch is a common reason for a 500 Hz EKF trace to appear as small repeated correction strokes around 10 Hz GPS updates.
+
+### Minimum healthy operating state
+
+Before trusting a log, check:
+
+```text
+mosaic-H fix: RTK Float or RTK Fixed
+mosaic-H AttEuler: valid, if external heading is used
+Teensy PPS rate: 1 /s
+Teensy CV7 ACK POS/VEL: increasing
+Teensy CV7 NACK total: 0
+CV7 filter state: Full Navigation
+CV7 GNSS Position/Velocity aiding: enabled and used
+CV7 Heading aiding: enabled and used only when real heading is valid
+```
 
 ## Target CV7 Configuration
 
@@ -137,6 +186,15 @@ Start 500 Hz logging:
 python IMU_EKF\CV7_INS_EKF.py --port COM13 --configure --rate-hz 500 --stream-preset csv --summary --print-hz 1 --record-csv --skip-check --expected-ekf-hz 500
 ```
 
+To record CV7 EKF and external GPS raw NMEA at the same time, use GPS auto-detection:
+
+```powershell
+python IMU_EKF\CV7_INS_EKF.py --list-ports
+python IMU_EKF\CV7_INS_EKF.py --port COM13 --gps-port auto --configure --rate-hz 500 --stream-preset csv --summary --print-hz 1 --record-csv --skip-check --expected-ekf-hz 500 --expected-gps-hz 10
+```
+
+Use the CV7 port for `--port`. `--gps-port auto` scans candidate serial ports and selects the one that is actually streaming NMEA sentences. If `--record-csv` is used and `--gps-port` is omitted, the script also tries GPS auto-detection.
+
 Linux example:
 
 ```bash
@@ -167,8 +225,40 @@ cv7_skip_validation_YYYYMMDD_HHMMSS.csv
 Notes:
 
 - `cv7_ekf_fused_*.csv` is the main file. It contains fused latitude, longitude, height, NED velocity, roll, pitch, yaw, and uncertainties.
-- `cv7_gps_raw_*.csv` is usually empty in this setup because GPS arrives as Teensy external aiding, not as the CV7 internal GNSS raw stream.
+- `cv7_gps_raw_*.csv` contains external GPS NMEA rows when `--gps-port` is used. Without `--gps-port`, it may contain only a header because GPS arrives as Teensy external aiding, not as the CV7 internal GNSS raw stream.
 - `cv7_skip_validation_*.csv` only records detected gap/skipping events. A file with only the header means no skipping was detected.
+
+## Record GPS Raw CSV From The Same Run
+
+The CV7 does not output raw GPS rows in the current setup. `CV7_INS_EKF.py` can therefore open the GPS receiver's NMEA serial port at the same time as the CV7 port. The external GPS rows are written into the same timestamped GPS CSV:
+
+```text
+cv7_gps_raw_YYYYMMDD_HHMMSS.csv
+```
+
+Those rows include host receive time, NMEA UTC time when available, the raw NMEA sentence, and parsed fields from GGA, RMC, VTG, GST, HDT, and ZDA messages.
+
+## Plot EKF/GPS Output
+
+After recording, open interactive 2D and 3D EKF/GPS point plots from the newest CSV file:
+
+```powershell
+python IMU_EKF\CV7_plot_ekf_gps.py
+```
+
+Or specify a file:
+
+```powershell
+python IMU_EKF\CV7_plot_ekf_gps.py --ekf-csv IMU_EKF\cv7_ekf_fused_YYYYMMDD_HHMMSS.csv
+```
+
+The script prints the number of EKF and GPS raw points, then opens matplotlib windows. It does not save image files. EKF and GPS samples are shown as points.
+
+If external GPS rows were recorded in the matching `cv7_gps_raw_*.csv`, the plot script uses them automatically. You can also pass a GPS CSV explicitly:
+
+```powershell
+python IMU_EKF\CV7_plot_ekf_gps.py --gps-csv IMU_EKF\cv7_gps_raw_YYYYMMDD_HHMMSS.csv
+```
 
 Stop logging:
 
