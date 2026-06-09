@@ -1,3 +1,0 @@
-C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/mip_sdk-populate.dir
-C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/ALL_BUILD.dir
-C:/Users/rqy19/Documents/github/Pavement_Scanning_Cam_Array/MIP_SDK_version/verify_tools/build/_deps/mip_sdk-subbuild/CMakeFiles/ZERO_CHECK.dir
