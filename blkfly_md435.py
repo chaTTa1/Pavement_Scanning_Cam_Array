@@ -60,6 +60,9 @@ TARGET_IP = '192.168.1.15'
 TARGET_PORT = PORT_MAP[CAMERA_ID]   # same port as before, now used for TCP image streaming
 stop_event = threading.Event()
 event_time = 0.0
+frameRate = 435
+exposureTime = 1000
+gain = 10
 
 
 def drop_oldest_and_put(q, item, label):
@@ -318,10 +321,10 @@ def capture_image(cam, frame_id, timeout=.5, save_path=None, return_array=True):
 
 def cam_configuration(nodemap,
                       s_node_map,
-                      frameRate=200,
+                      frameRate=frameRate,
                       pgrExposureCompensation=0,
-                      exposureTime=3000,
-                      gain=0,
+                      exposureTime=exposureTime,
+                      gain=gain,
                       blackLevel=0,
                       bufferCount=30,
                       verbose=True):
@@ -452,9 +455,9 @@ def acquire_images(cam,
                    stop_event,
                    cam_list,
                    system,
-                   frameRate=200,
-                   exposureTime=300,
-                   gain=0,
+                   frameRate=frameRate,
+                   exposureTime=exposureTime,
+                   gain=gain,
                    blackLevel=0,
                    bufferCount=300,
                    timeout=10,
@@ -740,9 +743,9 @@ def run_single_camera(cam,
                       triggerType,
                       cam_list,
                       system,
-                      frameRate=200,
-                      exposureTime=6000,
-                      gain=0,
+                      frameRate=frameRate,
+                      exposureTime=exposureTime,
+                      gain=gain,
                       bufferCount=30,
                       timeout=10):
     result = True
@@ -1325,9 +1328,9 @@ def main():
                                         triggerType=triggerType,
                                         cam_list=cam_list,
                                         system=system,
-                                        frameRate=435,
-                                        exposureTime=1000,
-                                        gain=None,
+                                        frameRate=frameRate,
+                                        exposureTime=exposureTime,
+                                        gain=gain,
                                         bufferCount=15,
                                         timeout=1000)
             print('Camera %d example complete...' % i)
