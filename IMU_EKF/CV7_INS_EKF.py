@@ -107,6 +107,7 @@ DESC_SENSOR = 0x80
 DESC_GNSS_LEGACY = 0x81
 DESC_FILTER = 0x82
 DESC_GNSS_MODULES = set(range(0x91, 0x96))
+DESC_SYSTEM_DATA = 0xA0
 
 FIELD_ACK_NACK = 0xF1
 
@@ -189,6 +190,13 @@ SENSOR_FIELDS = {
     0x14: "temperature_abs",
     0x17: "scaled_pressure",
     0x18: "overrange_status",
+}
+
+SYSTEM_FIELDS = {
+    0x01: "built_in_test",
+    0x02: "time_sync_status",
+    0x03: "gpio_state",
+    0x04: "gpio_analog_value",
 }
 
 GNSS_FIELDS = {
@@ -761,6 +769,47 @@ def decode_gnss_field(field: MipField) -> Dict:
     }
 
 
+def decode_system_field(field: MipField) -> Dict:
+    p = field.payload
+    d = field.field_descriptor
+    name = SYSTEM_FIELDS.get(d, f"unknown_system_0x{d:02X}")
+
+    if d == 0x01:
+        data = {
+            "bit_result_hex": p.hex(),
+            "bit_any_nonzero": any(byte != 0 for byte in p),
+        }
+    elif d == 0x02:
+        time_sync, last_pps = unpack(">BB", p, name)
+        data = {
+            "time_sync": bool(time_sync),
+            "time_sync_int": time_sync,
+            "last_pps_rcvd_s": last_pps,
+        }
+    elif d == 0x03:
+        states = unpack(">B", p, name)[0]
+        data = {
+            "gpio_states": states,
+            "gpio_states_hex": f"0x{states:02X}",
+        }
+    elif d == 0x04:
+        gpio_id, value = unpack(">Bf", p, name)
+        data = {
+            "gpio_id": gpio_id,
+            "gpio_analog_value_v": value,
+        }
+    else:
+        data = {"raw_hex": p.hex()}
+
+    return {
+        "source": "SYSTEM",
+        "descriptor_set": "0xA0",
+        "field": name,
+        "field_descriptor": f"0x{d:02X}",
+        **data,
+    }
+
+
 def decode_field(field: MipField) -> Optional[Dict]:
     if field.descriptor_set == DESC_FILTER:
         return decode_filter_field(field)
@@ -768,6 +817,8 @@ def decode_field(field: MipField) -> Optional[Dict]:
         return decode_sensor_field(field)
     if field.descriptor_set == DESC_GNSS_LEGACY or field.descriptor_set in DESC_GNSS_MODULES:
         return decode_gnss_field(field)
+    if field.descriptor_set == DESC_SYSTEM_DATA:
+        return decode_system_field(field)
     return None
 
 
@@ -1913,6 +1964,8 @@ def configure_streams(
     stream_preset: str,
 ) -> None:
     decimation = max(1, int(round(assume_base_rate_hz / max(1, rate_hz))))
+    system_rate_hz = min(max(1, rate_hz), 10)
+    system_decimation = max(1, int(round(assume_base_rate_hz / system_rate_hz)))
 
     send_command(ser, reader, DESC_BASE, CMD_BASE_SET_TO_IDLE)
 
@@ -1927,6 +1980,13 @@ def configure_streams(
         0x08,
         0x09,
         0x0A,
+        0x43,
+        0x44,
+        0x45,
+        0x46,
+        0xD3,
+        0xD5,
+        0xD7,
     ]
     full_filter_fields = core_filter_fields + [
         0x03,
@@ -1936,6 +1996,16 @@ def configure_streams(
         0x0D,
         0x0E,
         0x13,
+        0x1C,
+        0x43,
+        0x44,
+        0x45,
+        0x46,
+        0x50,
+        0x51,
+        0xD3,
+        0xD5,
+        0xD7,
     ]
     if stream_preset == "core":
         filter_field_candidates = [core_filter_fields]
@@ -1943,8 +2013,6 @@ def configure_streams(
         filter_field_candidates = [csv_filter_fields, core_filter_fields]
     else:
         filter_field_candidates = [
-            full_filter_fields + [0x46, 0x50, 0x51, 0xD3, 0xD5, 0xD7],
-            full_filter_fields + [0x46, 0xD3, 0xD7],
             full_filter_fields,
             csv_filter_fields,
             core_filter_fields,
@@ -1975,15 +2043,32 @@ def configure_streams(
     )
 
     if debug:
-        sensor_fields = [0x04, 0x05, 0x06, 0x0A, 0x0C, 0x12, 0x14, 0x17, 0x18]
+        sensor_field_candidates = [
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0A, 0x0C, 0x0E, 0x12, 0x14, 0x17, 0x18],
+            [0x04, 0x05, 0x0E, 0x12, 0x18],
+            [0x04, 0x05],
+        ]
+        system_field_candidates = [
+            [0x02, 0x01, 0x03],
+            [0x02],
+        ]
         gnss_fields = [0x03, 0x05, 0x09, 0x0B, 0x0D]
-        send_command(
-            ser,
-            reader,
-            DESC_3DM_CMD,
-            CMD_3DM_MESSAGE_FORMAT,
-            make_message_format_payload(DESC_SENSOR, sensor_fields, decimation),
-        )
+        last_sensor_error: Optional[MipError] = None
+        for sensor_fields in sensor_field_candidates:
+            try:
+                send_command(
+                    ser,
+                    reader,
+                    DESC_3DM_CMD,
+                    CMD_3DM_MESSAGE_FORMAT,
+                    make_message_format_payload(DESC_SENSOR, sensor_fields, decimation),
+                )
+                break
+            except MipError as exc:
+                last_sensor_error = exc
+        else:
+            assert last_sensor_error is not None
+            raise last_sensor_error
         send_command(
             ser,
             reader,
@@ -1991,6 +2076,27 @@ def configure_streams(
             CMD_3DM_DATASTREAM_CONTROL,
             make_datastream_payload(DESC_SENSOR, True),
         )
+        for system_fields in system_field_candidates:
+            try:
+                send_command(
+                    ser,
+                    reader,
+                    DESC_3DM_CMD,
+                    CMD_3DM_MESSAGE_FORMAT,
+                    make_message_format_payload(DESC_SYSTEM_DATA, system_fields, system_decimation),
+                    timeout_s=0.5,
+                )
+                send_command(
+                    ser,
+                    reader,
+                    DESC_3DM_CMD,
+                    CMD_3DM_DATASTREAM_CONTROL,
+                    make_datastream_payload(DESC_SYSTEM_DATA, True),
+                    timeout_s=0.5,
+                )
+                break
+            except MipError:
+                pass
         # On 7-series products GNSS module streams are usually 0x91..0x95.
         # Some legacy tools use 0x81, so enable both forms if the device accepts them.
         for desc_set in (DESC_GNSS_LEGACY, 0x91):
@@ -2209,6 +2315,73 @@ GPS_CSV_FIELDS = [
     "antenna_power",
     "valid_flags",
     "raw_fields_json",
+    "decoded_json",
+]
+
+IMU_CSV_FIELDS = [
+    "host_time_unix_s",
+    "sample_time_source",
+    "sample_time_s",
+    "skip_detected",
+    "skip_count_estimate",
+    "gap_s",
+    "expected_period_s",
+    "fields",
+    "raw_accel_x_counts",
+    "raw_accel_y_counts",
+    "raw_accel_z_counts",
+    "raw_gyro_x_counts",
+    "raw_gyro_y_counts",
+    "raw_gyro_z_counts",
+    "raw_mag_x_counts",
+    "raw_mag_y_counts",
+    "raw_mag_z_counts",
+    "accel_x_g",
+    "accel_y_g",
+    "accel_z_g",
+    "gyro_x_radps",
+    "gyro_y_radps",
+    "gyro_z_radps",
+    "mag_x_gauss",
+    "mag_y_gauss",
+    "mag_z_gauss",
+    "q_w",
+    "q_x",
+    "q_y",
+    "q_z",
+    "roll_deg",
+    "pitch_deg",
+    "yaw_deg",
+    "internal_ticks",
+    "gps_tow_s",
+    "gps_week",
+    "min_temp_c",
+    "max_temp_c",
+    "mean_temp_c",
+    "pressure_mbar",
+    "overrange_status",
+    "status_hex",
+    "decoded_json",
+]
+
+SYSTEM_CSV_FIELDS = [
+    "host_time_unix_s",
+    "sample_time_source",
+    "sample_time_s",
+    "skip_detected",
+    "skip_count_estimate",
+    "gap_s",
+    "expected_period_s",
+    "fields",
+    "time_sync",
+    "time_sync_int",
+    "last_pps_rcvd_s",
+    "bit_result_hex",
+    "bit_any_nonzero",
+    "gpio_states",
+    "gpio_states_hex",
+    "gpio_id",
+    "gpio_analog_value_v",
     "decoded_json",
 ]
 
@@ -2544,10 +2717,14 @@ class CsvRecorder:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         self.ekf_path = os.path.join(output_dir, f"{prefix}_ekf_fused_{stamp}.csv")
         self.gps_path = os.path.join(output_dir, f"{prefix}_gps_raw_{stamp}.csv")
+        self.imu_path = os.path.join(output_dir, f"{prefix}_imu_sensor_{stamp}.csv")
+        self.system_path = os.path.join(output_dir, f"{prefix}_system_{stamp}.csv")
         self.skip_path = os.path.join(output_dir, f"{prefix}_skip_validation_{stamp}.csv")
         self.expected_periods = {
             "EKF": 1.0 / expected_ekf_hz if expected_ekf_hz > 0 else 0.0,
             "GPS": 1.0 / expected_gps_hz if expected_gps_hz > 0 else 0.0,
+            "IMU": 1.0 / expected_ekf_hz if expected_ekf_hz > 0 else 0.0,
+            "SYSTEM": 1.0 / min(expected_ekf_hz, 10.0) if expected_ekf_hz > 0 else 0.0,
         }
         self.skip_threshold = skip_threshold
         self.skip_check = skip_check
@@ -2556,25 +2733,33 @@ class CsvRecorder:
 
         self._ekf_file = open(self.ekf_path, "w", newline="", encoding="utf-8")
         self._gps_file = open(self.gps_path, "w", newline="", encoding="utf-8")
+        self._imu_file = open(self.imu_path, "w", newline="", encoding="utf-8")
+        self._system_file = open(self.system_path, "w", newline="", encoding="utf-8")
         self._skip_file = open(self.skip_path, "w", newline="", encoding="utf-8")
         self.ekf_writer = csv.DictWriter(self._ekf_file, fieldnames=EKF_CSV_FIELDS, extrasaction="ignore")
         self.gps_writer = csv.DictWriter(self._gps_file, fieldnames=GPS_CSV_FIELDS, extrasaction="ignore")
+        self.imu_writer = csv.DictWriter(self._imu_file, fieldnames=IMU_CSV_FIELDS, extrasaction="ignore")
+        self.system_writer = csv.DictWriter(self._system_file, fieldnames=SYSTEM_CSV_FIELDS, extrasaction="ignore")
         self.skip_writer = csv.DictWriter(self._skip_file, fieldnames=SKIP_CSV_FIELDS, extrasaction="ignore")
         self.ekf_writer.writeheader()
         self.gps_writer.writeheader()
+        self.imu_writer.writeheader()
+        self.system_writer.writeheader()
         self.skip_writer.writeheader()
 
     def close(self) -> None:
         with self._lock:
-            for handle in (self._ekf_file, self._gps_file, self._skip_file):
+            for handle in (self._ekf_file, self._gps_file, self._imu_file, self._system_file, self._skip_file):
                 handle.flush()
                 handle.close()
 
-    def record(self, decoded_items: List[Dict]) -> Tuple[int, int, int]:
+    def record(self, decoded_items: List[Dict]) -> Tuple[int, int, int, int, int]:
         with self._lock:
             ekf_items = [item for item in decoded_items if item.get("source") == "EKF"]
             gps_items = [item for item in decoded_items if item.get("source") == "GPS"]
-            ekf_rows = gps_rows = skip_rows = 0
+            imu_items = [item for item in decoded_items if item.get("source") == "IMU_SENSOR"]
+            system_items = [item for item in decoded_items if item.get("source") == "SYSTEM"]
+            ekf_rows = gps_rows = imu_rows = system_rows = skip_rows = 0
 
             if ekf_items:
                 row = self._build_row("EKF", ekf_items)
@@ -2595,7 +2780,25 @@ class CsvRecorder:
                     self.skip_writer.writerow(skip)
                     skip_rows += 1
 
-        return ekf_rows, gps_rows, skip_rows
+            if imu_items:
+                row = self._build_row("IMU", imu_items)
+                skip = self._skip_row("IMU", row)
+                self.imu_writer.writerow(row)
+                imu_rows += 1
+                if skip:
+                    self.skip_writer.writerow(skip)
+                    skip_rows += 1
+
+            if system_items:
+                row = self._build_row("SYSTEM", system_items)
+                skip = self._skip_row("SYSTEM", row)
+                self.system_writer.writerow(row)
+                system_rows += 1
+                if skip:
+                    self.skip_writer.writerow(skip)
+                    skip_rows += 1
+
+        return ekf_rows, gps_rows, imu_rows, system_rows, skip_rows
 
     def record_external_gps(self, row: Dict[str, object]) -> Tuple[int, int]:
         with self._lock:
@@ -2697,6 +2900,8 @@ class CsvRecorder:
         with self._lock:
             self._ekf_file.flush()
             self._gps_file.flush()
+            self._imu_file.flush()
+            self._system_file.flush()
             self._skip_file.flush()
 
 
@@ -2867,7 +3072,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=0.0,
         help="Limit console printing rate. 0 means print every decoded packet.",
     )
-    parser.add_argument("--record-csv", action="store_true", help="Write GPS raw, EKF fused, and skip validation CSV files.")
+    parser.add_argument(
+        "--record-csv",
+        action="store_true",
+        help="Write EKF fused, GPS raw, IMU sensor, system diagnostics, and skip validation CSV files.",
+    )
     parser.add_argument("--csv-prefix", default="cv7", help="Prefix for CSV files written beside this script.")
     parser.add_argument("--skip-check", action="store_true", help="Enable skipped-sample/gap validation CSV logging.")
     parser.add_argument("--expected-ekf-hz", type=float, default=100.0, help="Expected EKF output rate for skip validation.")
@@ -3130,6 +3339,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "event": "csv_recording",
                     "ekf_csv": recorder.ekf_path,
                     "gps_csv": recorder.gps_path,
+                    "imu_csv": recorder.imu_path,
+                    "system_csv": recorder.system_path,
                     "skip_csv": recorder.skip_path,
                     "external_gps_port": gps_port,
                     "external_gps_port_source": gps_port_source,
@@ -3154,6 +3365,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     ekf_rows = 0
     gps_rows = 0
+    imu_rows = 0
+    system_rows = 0
     skip_rows = 0
     packets = 0
     decoded_fields = 0
@@ -3223,9 +3436,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         printable_items = decoded_items
 
                     if recorder:
-                        new_ekf_rows, new_gps_rows, new_skip_rows = recorder.record(decoded_items)
+                        new_ekf_rows, new_gps_rows, new_imu_rows, new_system_rows, new_skip_rows = recorder.record(decoded_items)
                         ekf_rows += new_ekf_rows
                         gps_rows += new_gps_rows
+                        imu_rows += new_imu_rows
+                        system_rows += new_system_rows
                         skip_rows += new_skip_rows
                         if time.time() - last_flush_time >= 1.0:
                             recorder.flush()
@@ -3272,6 +3487,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "decoded_fields": decoded_fields,
                 "ekf_csv_rows": ekf_rows,
                 "gps_csv_rows": gps_rows,
+                "imu_csv_rows": imu_rows,
+                "system_csv_rows": system_rows,
                 "external_gps_csv_rows": gps_thread.rows_written if gps_thread else 0,
                 "external_gps_lines": gps_thread.lines_read if gps_thread else 0,
                 "external_gps_bad_checksum": gps_thread.bad_checksum if gps_thread else 0,
