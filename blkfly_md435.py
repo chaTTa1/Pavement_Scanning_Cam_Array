@@ -63,7 +63,57 @@ event_time = 0.0
 frameRate = 435
 exposureTime = 1000
 gain = 10
+stats_lock = threading.Lock()
+captured_frames = 0
+encoded_frames = 0
+sent_frames = 0
+LOG_HOST = "192.168.1.15"
+LOG_PORT = 6000
+log_sock = None
 
+def connect_log_socket():
+    global log_sok
+    try:
+        log_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        log_sock.connect((LOG_HOST, LOG_PORT))
+        print("[log] connected")
+    except Exception as e:
+        print(f"[log] connect failed: {e}")
+        log_sock = None
+
+def remote_print(msg):
+    print(msg)
+    if log_sock is None:
+        return
+    try:
+        log_sock.sendall((msg+"\n").encode())
+    except Exception:
+        pass
+def stats_thread(stop_event):
+    global captured_frames, encoded_frames, sent_frames
+    prev_captures = 0
+    prev_encode = 0
+    prev_send = 0
+    while not stop_event.is_set():
+        time.sleep(1)
+        with stats_lock:
+            cap = captured_frames
+            enc = encoded_frames
+            snd = sent_frames
+        cap_fps = cap-prev_captures
+        enc_fps = enc-prev_encode
+        snd_fps= snd - prev_send
+        prev_captures = cap
+        prev_encode = enc
+        prev_send = snd
+        remote_print(
+            f"[FPS] "
+            f"capture={cap_fps} "
+            f"encode={enc_fps} "
+            f"send={snd_fps} "
+            f"save_q={save_q.qsize()} "
+            f"stream_q={stream_q.qsize()}"
+            )
 
 def drop_oldest_and_put(q, item, label):
     try:
@@ -126,6 +176,7 @@ def send_framed_payload(sock, payload):
 
 
 def broadcast_thread(stream_q, stop_event):
+    global sent_frames
     """
     TCP image streaming thread.
     Sends one full image payload per frame, prefixed with a 4-byte length.
@@ -170,6 +221,8 @@ def broadcast_thread(stream_q, stop_event):
             try:
                 print(f"[broadcast] sending frame {frame_id} bytes={len(final_packet)} to {TARGET_IP}:{TARGET_PORT}")
                 send_framed_payload(sock, final_packet)
+                with stats_lock:
+                    sent_frames += 1
                 print(f"[broadcast] sent frame {frame_id}")
             except OSError as e:
                 print(f"TCP send failed: {e}")
@@ -371,6 +424,7 @@ def cam_configuration(nodemap,
 
 
 def image_proc_thread(save_q, time_q, savedir, stop_event):
+    global encoded_frames
     count = 0
     while not stop_event.is_set() or not save_q.empty() or not time_q.empty():
         try:
@@ -396,6 +450,8 @@ def image_proc_thread(save_q, time_q, savedir, stop_event):
             print(f"[image_proc] encoded bytes={len(final_packet)} frame_id={frame_id}")
             exif_byte = exif_bytes('Flir', 'BlackFly', frame_time, 6)
             drop_oldest_and_put(stream_q, (frame_id, final_packet, exif_byte), "stream")
+            with stats_lock:
+                encoded_frames += 1
             print(f"[image_proc] pushed frame {frame_id} to stream_q")
             count += 1
         except queue.Empty:
@@ -502,7 +558,7 @@ def acquire_images(cam,
     nodemap = cam.GetNodeMap()
     nodemap_tldevice = cam.GetTLDeviceNodeMap()
     s_node_map = cam.GetTLStreamNodeMap()
-    global latest_gps
+    global latest_gps, captured_frames
 
     if verbose:
         print_device_info(nodemap_tldevice)
@@ -540,6 +596,8 @@ def acquire_images(cam,
                 print("Capture failed")
                 continue
             drop_oldest_and_put(save_q, (packet, offset), "save")
+            with stats_lock:
+                captured_frames += 1
             print(f"[acquire] pushed frame {count} to save_q")
 
             count += 1
@@ -1304,9 +1362,12 @@ def main():
     #gps_thread = threading.Thread(target=gps_listener, name="GPS-Listener", daemon=True)
     stream_thread = threading.Thread(target=broadcast_thread, args=(stream_q, stop_event), daemon=True)
     process_thread = threading.Thread(target=image_proc_thread, args=(save_q, time_q, savedir, stop_event), daemon=True)
+    connect_log_socket()
+    stats_thread_obj = threading.Thread(target=stats_thread, args=(stop_event,), daemon=True)
     process_thread.start()
     #gps_thread.start()
     stream_thread.start()
+    stats_thread_obj.start()
     time.sleep(5)
     print("[main] Threads after GPS start: ", [t.name for t in threading.enumerate()])
     print(latest_gps)
