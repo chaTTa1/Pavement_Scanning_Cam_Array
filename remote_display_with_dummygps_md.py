@@ -25,32 +25,30 @@ LISTEN_IP = "0.0.0.0"
 PORT = 5000
 WIDTH = 1920
 HEIGHT = 1080
-ls_q = queue.Queue(10000)
-ms_q = queue.Queue(10000)
-rs_q = queue.Queue(10000)
+raw_q = {
+    "left": queue.Queue(500),
+    "mid": queue.Queue(500),
+    "right": queue.Queue(500),
+}
+
+decoded_q = {
+    "left": queue.Queue(100),
+    "mid": queue.Queue(100),
+    "right": queue.Queue(100),
+}
+save_q = {
+    "left": queue.Queue(500),
+    "mid": queue.Queue(500),
+    "right": queue.Queue(500),
+}
 frame_lock = threading.Lock()
 latest_left = None
 latest_mid = None
 latest_right = None
 CAMERA_CONFIGS = {
-    "192.168.1.12": {
-        "label": "left",
-        "ssh_user": "ryan4",
-        "queue": ls_q,
-        "display_attr": "latest_left",
-    },
-    "192.168.1.11": {
-        "label": "mid",
-        "ssh_user": "ryan5",
-        "queue": ms_q,
-        "display_attr": "latest_mid",
-    },
-    "192.168.1.13": {
-        "label": "right",
-        "ssh_user": "ryan6",
-        "queue": rs_q,
-        "display_attr": "latest_right",
-    },
+    "192.168.1.12": {"label": "left", "ssh_user": "ryan4"},
+    "192.168.1.11": {"label": "mid",  "ssh_user": "ryan5"},
+    "192.168.1.13": {"label": "right","ssh_user": "ryan6"},
 }
 def create_tcp_server(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -73,8 +71,9 @@ def accept_client(server_sock, label):
             continue
 
 
-def recv_exact(sock, n):
+def recv_exact(sock, n, timeout = 2.0):
     buf = b''
+    sock.settimeout(timeout)
     while len(buf) < n:
         try:
             chunk = sock.recv(n - len(buf))
@@ -113,7 +112,7 @@ def init():
     for host, config in CAMERA_CONFIGS.items():
         remote_cmd = (
             f"cd /home/{config['ssh_user']}/Alex/Blackfly && "
-            f"nohup python3 blkfly_md.py > /tmp/{config['label']}_blkfly_md.log 2>&1 &"
+            f"nohup python3 blkfly_md435.py > /tmp/{config['label']}_blkfly_md435.log 2>&1 &"
         )
         try:
             subprocess.Popen(["ssh", f"{config['ssh_user']}@{host}", remote_cmd])
@@ -124,81 +123,74 @@ def init():
 
 def receiver(server_sock, label):
     global latest_left, latest_mid, latest_right
-
+    frame_count = 0
+    last_time = time.time()
     while not stop_event.is_set():
         print(f"{label}: waiting for connection...")
-
         conn, addr = accept_client(server_sock, label)
-        if conn is None:
-            continue
-
-        sender_ip, _ = addr
-        config = CAMERA_CONFIGS.get(sender_ip)
-
-        if config is None:
-            print(f"{label}: unknown ip {sender_ip}, closing connection")
-            conn.close()
-            continue
-
-        print(f"{label}: streaming from {sender_ip}")
 
         try:
             while not stop_event.is_set():
-                # ---- Read frame length ----
                 header = recv_exact(conn, 4)
                 if header is None:
-                    print(f"{label}: connection closed by client")
                     break
 
                 frame_len = struct.unpack("!I", header)[0]
-                print(f"{label}: got header frame_len={frame_len}")
 
-                # ---- Read frame payload ----
                 payload = recv_exact(conn, frame_len)
                 if payload is None:
-                    print(f"{label}: incomplete frame / disconnect")
                     break
-                print(f"{label}: got payload bytes={len(payload)}")
-                
-                # ---- Decode ----
-                npdata = np.frombuffer(payload, dtype=np.uint8)
-                frame = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
-                if frame is None:
-                    print(f"{label}: decode failed")
-                    continue
 
-                # ---- Queue + display ----
-                put_latest(config["queue"], payload, config["label"])
-
+                # ONLY STORE RAW PACKET
+                q = raw_q[label]
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except:
+                        pass
+                q.put_nowait(payload)
+                frame_count += 1
+                now = time.time()
+                elapsed = now-last_time
+                if elapsed >= 3:
+                    fps = frame_count/elapsed
+                    print(f"{label} camera recieving {fps} fps")
+                    frame_count = 0
+                    last_time = now
                 with frame_lock:
-                    if config["display_attr"] == "latest_left":
-                        latest_left = frame
-                    elif config["display_attr"] == "latest_mid":
-                        latest_mid = frame
+                    if label == "left":
+                        latest_left = payload 
+                    elif label == "mid":
+                        latest_mid = payload
                     else:
-                        latest_right = frame
-
-        except (ConnectionResetError, BrokenPipeError) as e:
-            print(f"{label}: connection error: {e}")
+                        latest_right = payload
 
         except Exception as e:
-            print(f"{label}: unexpected error: {e}")
-
+            print(f"{label} receiver error: {e}")
         finally:
-            try:
-                conn.close()
-            except:
-                pass
+            conn.close()
 
-            with frame_lock:
-                if label == "left":
-                    latest_left = None
-                elif label == "mid":
-                    latest_mid = None
-                else:
-                    latest_right = None
-            print(f"{label}: disconnected, restarting accept loop...")
-            time.sleep(.2)  # prevent tight reconnect loop
+def decoder(label):
+    global latest_left, latest_mid, latest_right
+
+    while not stop_event.is_set():
+        try:
+            payload = raw_q[label].get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        npdata = np.frombuffer(payload, dtype=np.uint8)
+        frame = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
+
+        if frame is None:
+            continue
+
+        # update display buffer
+
+
+        # forward to saver (optional)
+        if not save_q[label].full():
+            save_q[label].put(payload)
         
 '''def displayer():
     global latest_left, latest_mid, latest_right
@@ -291,40 +283,38 @@ def gps_dummy_sender():
     
 def saver():
     counters = {"left": 1, "mid": 1, "right": 1}
-    paths = {
-        "left": r"C:\SFM_IMAGES\left_cam",
-        "mid": r"C:\SFM_IMAGES\mid_cam",
-        "right": r"C:\SFM_IMAGES\right_cam",
-    }
-    source_queues = {"left": ls_q, "mid": ms_q, "right": rs_q}
 
-    for path in paths.values():
-        os.makedirs(path, exist_ok=True)
+    paths = {
+        "left": "road_test_2/left_cam",
+        "mid": "road_test_2/mid_cam",
+        "right": "road_test_2/right_cam",
+    }
+
+    for p in paths.values():
+        os.makedirs(p, exist_ok=True)
 
     while not stop_event.is_set():
         made_progress = False
 
-        for label, q in source_queues.items():
+        for label in ["left", "mid", "right"]:
             try:
-                img_bytes = q.get(timeout=0.05)
+                payload = save_q[label].get(timeout=0.05)
             except queue.Empty:
                 continue
 
             made_progress = True
+            i = counters[label]
+            file_path = os.path.join(paths[label], f"frame_{i}.jpg")
+
             try:
-                i = counters[label]
-                file_path = os.path.join(paths[label], f"frame_{i}.jpg")
                 with open(file_path, "wb") as f:
-                    f.write(img_bytes)
+                    f.write(payload)
                 counters[label] += 1
-                print(f"saved {label} frame {i}")
-            except OSError as e:
-                print(f"Save error for {label} frame {counters[label]}: {e}")
+            except Exception as e:
+                print(f"saver error {label}: {e}")
 
         if not made_progress:
-            time.sleep(0.05)
-
-    print("saver exiting cleanly")
+            time.sleep(0.02)
 
         
 # Wait for the "READY" signal from remote
@@ -351,7 +341,7 @@ camera_positions = {
 running = True
 while running:
     for event in pygame.event.get():
-        if event.type == pygame.QUIT:
+        if event.type == pyg+ame.QUIT:
             running = False
 
     data, addr = sock.recvfrom(65536)  # Max UDP size
@@ -404,7 +394,7 @@ def de_init():
     for host, config in CAMERA_CONFIGS.items():
         try:
             result = subprocess.run(
-                ["ssh", f"{config['ssh_user']}@{host}", "pgrep -f blkfly_md.py"],
+                ["ssh", f"{config['ssh_user']}@{host}", "pgrep -f blkfly_md435.py"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -438,12 +428,23 @@ def main():
     l_rec_thread = threading.Thread(target=receiver, args=(l_sock, "left"), daemon=True)
     m_rec_thread = threading.Thread(target=receiver, args=(m_sock, "mid"), daemon=True)
     r_rec_thread = threading.Thread(target=receiver, args=(r_sock, "right"), daemon=True)
+
+    l_dec_thread = threading.Thread(target=decoder, args=("left",), daemon=True)
+    m_dec_thread = threading.Thread(target=decoder, args=("mid",), daemon=True)
+    r_dec_thread = threading.Thread(target=decoder, args=("right",), daemon=True)
+
     save_thread = threading.Thread(target=saver, daemon = True)
     #disp_thread = threading.Thread(target = displayer, daemon = True)
     gps_thread = threading.Thread(target=gps_dummy_sender, daemon=True)
     l_rec_thread.start()
     m_rec_thread.start()
     r_rec_thread.start()
+
+    l_dec_thread.start()
+    m_dec_thread.start()
+    r_dec_thread.start()
+
+
     init()
     save_thread.start()
     #disp_thread.start()
@@ -463,13 +464,33 @@ def main():
                     running = False
                     stop_event.set()
             with frame_lock:
-                left_img = latest_left
-                mid_img = latest_mid
-                right_img = latest_right
-            if left_img is None and mid_img is None and right_img is None:
+                left_img = None
+                mid_img = None
+                right_img = None
+                left_bytes = latest_left
+                mid_bytes = latest_mid
+                right_bytes = latest_right
+            if left_bytes is None and mid_bytes is None and right_bytes is None:
                 print('all cameras failing to send')
                 clock.tick(30)
                 continue
+            if left_bytes is not None:
+                npdata = np.frombuffer(left_bytes, dtype=np.uint8)
+                left_img = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
+            else:
+                #print('left camera failing')
+                pass
+            if mid_bytes is not None:
+                npdata = np.frombuffer(mid_bytes, dtype=np.uint8)
+                mid_img = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
+            else:
+                #print('mid camera failing')
+                pass
+            if right_bytes is not None:
+                npdata = np.frombuffer(right_bytes, dtype=np.uint8)
+                right_img = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
+            else:
+                print('right camera failing')
             
             left_text = 'left camera'
             mid_text = 'mid camera'
@@ -500,7 +521,7 @@ def main():
             screen.blit(m_text_surface, mid_rect)
             screen.blit(r_text_surface, right_rect)
             pygame.display.flip()
-            clock.tick(144)
+            clock.tick(30)
     except KeyboardInterrupt:
         stop_event.set()
     except Exception as e:
@@ -524,5 +545,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
