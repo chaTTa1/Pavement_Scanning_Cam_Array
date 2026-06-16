@@ -23,6 +23,7 @@ import struct
 # =====================
 LISTEN_IP = "0.0.0.0"
 PORT = 5000
+STAT_PORT = 6000
 WIDTH = 1920
 HEIGHT = 1080
 raw_q = {
@@ -50,6 +51,21 @@ CAMERA_CONFIGS = {
     "192.168.1.11": {"label": "mid",  "ssh_user": "ryan5"},
     "192.168.1.13": {"label": "right","ssh_user": "ryan6"},
 }
+
+def stat_thread():
+    stat_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    stat_server.bind((LISTEN_IP, STAT_PORT))
+    stat_server.listen(5)
+    conn, addr = stat_server.accecpt()
+    print('connected:', addr)
+    while not stop_event.is_set():
+        data = conn.recv(4096)
+
+        if not data:
+            break
+
+        print(data.decode(), end="")
+    
 def create_tcp_server(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -436,6 +452,7 @@ def main():
     save_thread = threading.Thread(target=saver, daemon = True)
     #disp_thread = threading.Thread(target = displayer, daemon = True)
     gps_thread = threading.Thread(target=gps_dummy_sender, daemon=True)
+    stats_thread = threading.Thread(target=stat_thread, daemon=True)
     l_rec_thread.start()
     m_rec_thread.start()
     r_rec_thread.start()
@@ -443,6 +460,7 @@ def main():
     l_dec_thread.start()
     m_dec_thread.start()
     r_dec_thread.start()
+    stats_thread.start()
 
 
     init()
@@ -490,7 +508,8 @@ def main():
                 npdata = np.frombuffer(right_bytes, dtype=np.uint8)
                 right_img = cv2.imdecode(npdata, cv2.IMREAD_GRAYSCALE)
             else:
-                print('right camera failing')
+                #print('right camera failing')
+                pass
             
             left_text = 'left camera'
             mid_text = 'mid camera'
@@ -540,6 +559,7 @@ def main():
         r_rec_thread.join(timeout=5)
         save_thread.join(timeout=5)
         gps_thread.join(timeout=5)
+        stats_thread.join(timeout=5)
         print('main exiting')
         
 
