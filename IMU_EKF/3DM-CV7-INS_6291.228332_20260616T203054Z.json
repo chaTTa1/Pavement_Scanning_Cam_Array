@@ -1,0 +1,324 @@
+{
+    "document" : {
+        "version" : 1,
+        "dateCreated" : "2026-06-16 20:30:58",
+        "sensorConnectVersion" : {
+            "major" : 16,
+            "minor" : 3,
+            "patch" : 0
+        },
+        "msclVersion" : {
+            "major" : 68,
+            "minor" : 0,
+            "patch" : 0
+        }
+    },
+    "device" : {
+        "name" : "3DM-CV7-INS",
+        "modelNumber" : "6291-9960",
+        "serialNumber" : "6291.228332",
+        "firmwareVersion" : "1.4.54",
+        "deviceOptions" : "4-16g,250-1kdps"
+    },
+    "state" : {
+        "0109" : {
+            "name" : "Comm Port Speed",
+            "commands" : [
+                "75650108080901010001C200B936"
+            ]
+        },
+        "0C0C" : {
+            "name" : "NMEA Message Format",
+            "commands" : [
+                "75650C04040C0100FBFD"
+            ]
+        },
+        "0C0F" : {
+            "name" : "Message Format",
+            "commands" : [
+                "75650C17170F018006D3000AD5000A06000A07000A08000A17000ABA1A",
+                "75650C38380F018211D30064D500640100640200640500640600640700640800640900640A00640B00640C0064100064400064410064420064460064A519",
+                "75650C11110F019404D300010300010500010B00019A53",
+                "75650C11110F01A004D303E8D503E80103E80203E81352"
+            ]
+        },
+        "0C11" : {
+            "name" : "Enable/Disable Device Continuous Data Stream",
+            "commands" : [
+                "75650C0505110180018318",
+                "75650C050511018201851C",
+                "75650C0505110194019740",
+                "75650C05051101A001A358"
+            ]
+        },
+        "0C28" : {
+            "name" : "PPS Source",
+            "commands" : [
+                "75650C04042801031A54"
+            ]
+        },
+        "0C2B" : {
+            "name" : "Event Control",
+            "commands" : [
+                "75650C05052B0101001D81",
+                "75650C05052B0102001E83",
+                "75650C05052B0103001F85",
+                "75650C05052B0104002087",
+                "75650C05052B0105002189",
+                "75650C05052B010600228B",
+                "75650C05052B010700238D",
+                "75650C05052B010800248F",
+                "75650C05052B0109002591",
+                "75650C05052B010A002693",
+                "75650C05052B010B002795",
+                "75650C05052B010C002897"
+            ]
+        },
+        "0C2E" : {
+            "name" : "Event Trigger Configuration",
+            "commands" : [
+                "75650C05052E010100208D",
+                "75650C05052E010200218F",
+                "75650C05052E0103002291",
+                "75650C05052E0104002393",
+                "75650C05052E0105002495",
+                "75650C05052E0106002597",
+                "75650C05052E0107002699",
+                "75650C05052E010800279B",
+                "75650C05052E010900289D",
+                "75650C05052E010A00299F",
+                "75650C05052E010B002AA1",
+                "75650C05052E010C002BA3"
+            ]
+        },
+        "0C2F" : {
+            "name" : "Event Action Configuration",
+            "commands" : [
+                "75650C06062F0101000023BF",
+                "75650C06062F0102000024C2",
+                "75650C06062F0103000025C5",
+                "75650C06062F0104000026C8",
+                "75650C06062F0105000027CB",
+                "75650C06062F0106000028CE",
+                "75650C06062F0107000029D1",
+                "75650C06062F010800002AD4",
+                "75650C06062F010900002BD7",
+                "75650C06062F010A00002CDA",
+                "75650C06062F010B00002DDD",
+                "75650C06062F010C00002EE0"
+            ]
+        },
+        "0C31" : {
+            "name" : "Sensor to Vehicle Frame Transformation Euler Angles",
+            "commands" : [
+                "75650C0F0F31010000000000000000000000003621"
+            ]
+        },
+        "0C32" : {
+            "name" : "Sensor to Vehicle Frame Transformation Quaternion",
+            "commands" : [
+                "75650C131332013F8000008000000080000000800000007E17"
+            ]
+        },
+        "0C33" : {
+            "name" : "Sensor to Vehicle Frame Transformation DCM",
+            "commands" : [
+                "75650C272733013F8000000000000000000000000000003F8000000000000000000000000000003F800000A529"
+            ]
+        },
+        "0C37" : {
+            "name" : "Accel Bias",
+            "commands" : [
+                "75650C0F0F37010000000000000000000000003C75"
+            ]
+        },
+        "0C38" : {
+            "name" : "Gyro Bias",
+            "commands" : [
+                "75650C0F0F38010000000000000000000000003D83"
+            ]
+        },
+        "0C3A" : {
+            "name" : "Magnetometer Hard Iron Offset",
+            "commands" : [
+                "75650C0F0F3A010000000000000000000000003F9F"
+            ]
+        },
+        "0C3B" : {
+            "name" : "Magnetometer Soft Iron Matrix",
+            "commands" : [
+                "75650C27273B013F8000000000000000000000000000003F8000000000000000000000000000003F800000AD59"
+            ]
+        },
+        "0C40" : {
+            "name" : "Change UART Baud Rate",
+            "commands" : [
+                "75650C070740010001C200F8DA"
+            ]
+        },
+        "0C41" : {
+            "name" : "GPIO Configuration",
+            "commands" : [
+                "75650C07074101010201003A65",
+                "75650C07074101020522005FB4",
+                "75650C07074101030000003965",
+                "75650C07074101040000003A69"
+            ]
+        },
+        "0C43" : {
+            "name" : "Odometer Settings",
+            "commands" : [
+                "75650C0C0C4301007F8000007F80000040EE"
+            ]
+        },
+        "0C51" : {
+            "name" : "Complementary Filter Settings",
+            "commands" : [
+                "75650C0D0D510101014120000041200000165E"
+            ]
+        },
+        "0C52" : {
+            "name" : "Sensor Range",
+            "commands" : [
+                "75650C0505520101034720",
+                "75650C0505520102034822",
+                "75650C0505520103014722"
+            ]
+        },
+        "0C54" : {
+            "name" : "Low-Pass Filter Settings",
+            "commands" : [
+                "75650C0B0B5401800401004379FFFE8FE0",
+                "75650C0B0B5401800501004379FFFE90E7",
+                "75650C0B0B5401800601007F800000D7F7",
+                "75650C0B0B5401801701007F800000E86E",
+                "75650C0B0B5401820D01007F800000E038",
+                "75650C0B0B5401820E01007F800000E13F",
+                "75650C0B0B5401821C01007F800000EFA1"
+            ]
+        },
+        "0D13" : {
+            "name" : "Antenna Offset",
+            "commands" : [
+                "75650D0F0F1301000000000000000000000000198E"
+            ]
+        },
+        "0D1A" : {
+            "name" : "Accelerometer Noise Standard Deviation",
+            "commands" : [
+                "75650D0F0F1A013C23D70A3C23D70A3C23D70AE023"
+            ]
+        },
+        "0D1B" : {
+            "name" : "Gyroscope Noise Standard Deviation",
+            "commands" : [
+                "75650D0F0F1B0138D1B71738D1B71738D1B717A69A"
+            ]
+        },
+        "0D1C" : {
+            "name" : "Accelerometer Bias Model Parameters",
+            "commands" : [
+                "75650D1B1B1C010000000000000000000000003649539C3649539C3649539C843F"
+            ]
+        },
+        "0D1D" : {
+            "name" : "Gyroscope Bias Model Parameters",
+            "commands" : [
+                "75650D1B1B1D0100000000000000000000000034A10FB034A10FB034A10FB0F7C5"
+            ]
+        },
+        "0D20" : {
+            "name" : "Zero Angular Rate Update Control",
+            "commands" : [
+                "75650D08082001000000000018C3"
+            ]
+        },
+        "0D28" : {
+            "name" : "Gravity Noise Standard Deviation",
+            "commands" : [
+                "75650D0F0F28013D4CCCCD3D4CCCCD3D4CCCCD9403"
+            ]
+        },
+        "0D43" : {
+            "name" : "Declination Source",
+            "commands" : [
+                "75650D0808430102000000003DC2"
+            ]
+        },
+        "0D50" : {
+            "name" : "Aiding Measurement Enable",
+            "commands" : [
+                "75650D06065001000001456A",
+                "75650D06065001000200466D",
+                "75650D060650010004004871",
+                "75650D060650010005014A74",
+                "75650D060650010006004A75",
+                "75650D060650010007004B77",
+                "75650D060650010008004C79"
+            ]
+        },
+        "0D52" : {
+            "name" : "Filter Initialization Configuration",
+            "commands" : [
+                "75650D2B2B5201000008000000000000000000000000000000000000000000000000000000000000000000000000029A56"
+            ]
+        },
+        "0D53" : {
+            "name" : "Adaptive Filter Options",
+            "commands" : [
+                "75650D06065301023A981B8A"
+            ]
+        },
+        "0D55" : {
+            "name" : "Relative Position Reference",
+            "commands" : [
+                "75650D1D1D550100010000000000000000000000000000000000000000000000007877"
+            ]
+        },
+        "0D56" : {
+            "name" : "Reference Point Lever Arm Offset",
+            "commands" : [
+                "75650D10105601010000000000000000000000005FC2"
+            ]
+        },
+        "0D61" : {
+            "name" : "Speed Measurement Lever Arm Offset",
+            "commands" : [
+                "75650D10106101010000000000000000000000006A67"
+            ]
+        },
+        "0D63" : {
+            "name" : "Wheeled Vehicle Constraint",
+            "commands" : [
+                "75650D04046301005308"
+            ]
+        },
+        "0D64" : {
+            "name" : "GNSS Antenna Cal Control",
+            "commands" : [
+                "75650D08086401013E19999AE7B3"
+            ]
+        },
+        "1301" : {
+            "name" : "Aiding Frame Configuration",
+            "commands" : [
+                "756513222201010102000000000000000000000000003F80000080000000800000008000000075D9",
+                "756513222201010202000000000000000000000000003F80000080000000800000008000000076F8",
+                "756513222201010302000000000000000000000000003F8000008000000080000000800000007717",
+                "756513222201010402000000000000000000000000003F8000008000000080000000800000007836"
+            ]
+        },
+        "131F" : {
+            "name" : "Aiding Measurement Response Mode",
+            "commands" : [
+                "75651304041F01021762"
+            ]
+        },
+        "7F10" : {
+            "name" : "Communication Mode",
+            "commands" : [
+                "75657F040410010173BC"
+            ]
+        }
+    }
+}

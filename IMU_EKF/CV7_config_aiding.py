@@ -327,10 +327,9 @@ def run_interface_control(
 
 
 def make_user_heading_initialization_payload(heading_deg: float) -> bytes:
-    heading_rad = math.radians(heading_deg)
     return (
         bytes((MIP_FUNCTION_WRITE, 0x00, 0x01, 0x00))
-        + struct.pack(">fff", heading_rad, 0.0, 0.0)
+        + struct.pack(">fff", heading_deg, 0.0, 0.0)
         + struct.pack(">fff", 0.0, 0.0, 0.0)
         + struct.pack(">fff", 0.0, 0.0, 0.0)
         + bytes((0x02,))
