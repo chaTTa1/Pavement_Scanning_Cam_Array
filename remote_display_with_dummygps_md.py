@@ -23,7 +23,9 @@ import struct
 # =====================
 LISTEN_IP = "0.0.0.0"
 PORT = 5000
-STAT_PORT = 6000
+STAT_PORT1 = 6000
+STAT_PORT2 = 6001
+STAT_PORT3 = 6002
 WIDTH = 1920
 HEIGHT = 1080
 raw_q = {
@@ -52,7 +54,7 @@ CAMERA_CONFIGS = {
     "192.168.1.13": {"label": "right","ssh_user": "ryan6"},
 }
 
-def stat_thread():
+def stat_thread(STAT_PORT):
     stat_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     stat_server.bind((LISTEN_IP, STAT_PORT))
     stat_server.listen(5)
@@ -436,7 +438,7 @@ def de_init():
     
     
 def main():
-    global l_sock, m_sock, r_sock
+    global l_sock, m_sock, r_sock, STAT_PORT1, STAT_PORT2, STAT_PORT3
     l_sock = create_tcp_server(5001)
     m_sock = create_tcp_server(5002)
     r_sock = create_tcp_server(5000)
@@ -452,7 +454,9 @@ def main():
     save_thread = threading.Thread(target=saver, daemon = True)
     #disp_thread = threading.Thread(target = displayer, daemon = True)
     gps_thread = threading.Thread(target=gps_dummy_sender, daemon=True)
-    stats_thread = threading.Thread(target=stat_thread, daemon=True)
+    m_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT1), daemon=True)
+    l_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT2), daemon=True)
+    r_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT3), daemon=True)
     l_rec_thread.start()
     m_rec_thread.start()
     r_rec_thread.start()
@@ -460,7 +464,9 @@ def main():
     l_dec_thread.start()
     m_dec_thread.start()
     r_dec_thread.start()
-    stats_thread.start()
+    m_stats_thread.start()
+    l_stats_thread.start()
+    r_stats_thread.start()
 
 
     init()
@@ -559,7 +565,9 @@ def main():
         r_rec_thread.join(timeout=5)
         save_thread.join(timeout=5)
         gps_thread.join(timeout=5)
-        stats_thread.join(timeout=5)
+        m_stats_thread.join(timeout=5)
+        l_stats_thread.join(timeout=5)
+        r_stats_thread.join(timeout=5)
         print('main exiting')
         
 
