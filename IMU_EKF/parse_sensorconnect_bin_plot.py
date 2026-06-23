@@ -231,7 +231,7 @@ def save_fig(fig, output_dir, name):
     print("Saved:", path)
 
 
-def plot_series(ax, df, x_col, y_col, label, color, marker=".", every=1):
+def plot_series(ax, df, x_col, y_col, label, color, marker=".", size=9):
     if df.empty or x_col not in df.columns or y_col not in df.columns:
         return
     x = pd.to_numeric(df[x_col], errors="coerce")
@@ -239,19 +239,186 @@ def plot_series(ax, df, x_col, y_col, label, color, marker=".", every=1):
     mask = np.isfinite(x) & np.isfinite(y)
     x = x[mask]
     y = y[mask]
-    if every > 1 and len(x) > every:
-        x = x.iloc[::every]
-        y = y.iloc[::every]
     if len(x):
-        ax.scatter(x, y, s=9, color=color, marker=marker, label=label, alpha=0.85)
+        ax.scatter(x, y, s=size, color=color, marker=marker, label=label, alpha=0.85)
+
+
+def first_existing_numeric_column(df, candidates):
+    for col in candidates:
+        if col in df.columns:
+            values = pd.to_numeric(df[col], errors="coerce")
+            if values.replace([np.inf, -np.inf], np.nan).notna().any():
+                return col
+    return None
+
+
+def finite_numeric_columns(df, exclude=None):
+    exclude = set(exclude or [])
+    cols = []
+    for col in df.columns:
+        if col in exclude:
+            continue
+        values = pd.to_numeric(df[col], errors="coerce")
+        if values.replace([np.inf, -np.inf], np.nan).notna().any():
+            cols.append(col)
+    return cols
+
+
+
+def extract_3d_position(df, name):
+    if df.empty:
+        print(f"{name} 3D plot skipped: no rows")
+        return None
+    z_col = first_existing_numeric_column(
+        df,
+        [
+            "ellipsoid_height_m",
+            "height_ellipsoid_m",
+            "height_above_ellipsoid_m",
+            "msl_height_m",
+            "height_m",
+            "altitude_m",
+        ],
+    )
+    if "east_m" not in df.columns or "north_m" not in df.columns or z_col is None:
+        print(f"{name} 3D plot skipped: need east_m, north_m, and a height column")
+        return None
+
+    x = pd.to_numeric(df["east_m"], errors="coerce")
+    y = pd.to_numeric(df["north_m"], errors="coerce")
+    z = pd.to_numeric(df[z_col], errors="coerce")
+    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    x = x[mask]
+    y = y[mask]
+    z = z[mask]
+    if not len(x):
+        print(f"{name} 3D plot skipped: no finite 3D points")
+        return None
+    return x, y, z, z_col
+
+
+def plot_position_3d(df, name, output_dir, stamp, file_label, marker_size=14):
+    extracted = extract_3d_position(df, name)
+    if extracted is None:
+        return
+    x, y, z, z_col = extracted
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(x, y, z, s=marker_size, label=name, alpha=0.85)
+    ax.set_title(name)
+    ax.set_xlabel("east from shared origin (m)")
+    ax.set_ylabel("north from shared origin (m)")
+    ax.set_zlabel(f"{z_col} (m)")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    save_fig(fig, output_dir, f"sensorconnect_{file_label}_3d_{stamp}.png")
+
+
+def plot_position_3d_overlay(ekf, gnss, output_dir, stamp):
+    ekf_xyz = extract_3d_position(ekf, "EKF fused position")
+    gnss_xyz = extract_3d_position(gnss, "GNSS raw position")
+    if ekf_xyz is None and gnss_xyz is None:
+        return
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    z_label = "height (m)"
+    if gnss_xyz is not None:
+        x, y, z, z_col = gnss_xyz
+        z_label = f"{z_col} (m)"
+        ax.scatter(x, y, z, s=14, label="GNSS raw points", alpha=0.75)
+    if ekf_xyz is not None:
+        x, y, z, z_col = ekf_xyz
+        z_label = f"{z_col} (m)"
+        ax.scatter(x, y, z, s=9, label="EKF fused points", alpha=0.85)
+
+    ax.set_title("GNSS raw points and EKF fused points, 3D")
+    ax.set_xlabel("east from shared origin (m)")
+    ax.set_ylabel("north from shared origin (m)")
+    ax.set_zlabel(z_label)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    save_fig(fig, output_dir, f"sensorconnect_gnss_ekf_3d_overlay_{stamp}.png")
+
+
+def plot_imu_outputs(imu, output_dir, stamp):
+    if imu.empty:
+        print("IMU plot skipped: no IMU rows")
+        return
+    if "x_time_s" not in imu.columns:
+        print("IMU plot skipped: x_time_s not found")
+        return
+
+    exclude = {
+        "packet_index",
+        "plot_time_s",
+        "x_time_s",
+        "reference_time_s",
+        "gps_tow_s",
+        "descriptor_set",
+        "fields",
+    }
+    numeric_cols = finite_numeric_columns(imu, exclude=exclude)
+    print("IMU numeric columns plotted:", numeric_cols)
+    if not numeric_cols:
+        print("IMU plot skipped: no numeric IMU columns")
+        return
+
+    groups = [
+        ("accel", [c for c in numeric_cols if "accel" in c.lower()]),
+        ("gyro", [c for c in numeric_cols if "gyro" in c.lower() or "angular" in c.lower()]),
+        ("mag", [c for c in numeric_cols if "mag" in c.lower()]),
+        ("pressure", [c for c in numeric_cols if "pressure" in c.lower()]),
+        ("temperature", [c for c in numeric_cols if "temp" in c.lower()]),
+    ]
+
+    plotted = set()
+    for group_name, cols in groups:
+        cols = [c for c in cols if c not in plotted]
+        if not cols:
+            continue
+        fig, axes = plt.subplots(len(cols), 1, figsize=(13, max(4, 2.4 * len(cols))), sharex=True)
+        if len(cols) == 1:
+            axes = [axes]
+        for ax, col in zip(axes, cols):
+            plot_series(ax, imu, "x_time_s", col, col, "black", size=6)
+            ax.set_ylabel(col)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+        axes[-1].set_xlabel("time from first sample (s)")
+        fig.suptitle(f"IMU {group_name} records, all samples")
+        fig.tight_layout()
+        save_fig(fig, output_dir, f"sensorconnect_imu_{group_name}_{stamp}.png")
+        plotted.update(cols)
+
+    remaining_cols = [c for c in numeric_cols if c not in plotted]
+    if remaining_cols:
+        fig, axes = plt.subplots(len(remaining_cols), 1, figsize=(13, max(4, 2.2 * len(remaining_cols))), sharex=True)
+        if len(remaining_cols) == 1:
+            axes = [axes]
+        for ax, col in zip(axes, remaining_cols):
+            plot_series(ax, imu, "x_time_s", col, col, "black", size=6)
+            ax.set_ylabel(col)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+        axes[-1].set_xlabel("time from first sample (s)")
+        fig.suptitle("IMU remaining numeric records, all samples")
+        fig.tight_layout()
+        save_fig(fig, output_dir, f"sensorconnect_imu_other_numeric_{stamp}.png")
 
 
 def plot_outputs(ekf, imu, gnss, aid, output_dir, stamp):
     add_local_xy([ekf, gnss])
+    plot_position_3d(gnss, "GNSS raw 3D points", output_dir, stamp, "gnss", marker_size=14)
+    plot_position_3d(ekf, "EKF fused 3D points from IMU plus GNSS filter", output_dir, stamp, "ekf", marker_size=9)
+    plot_position_3d_overlay(ekf, gnss, output_dir, stamp)
+    plot_imu_outputs(imu, output_dir, stamp)
 
     fig, ax = plt.subplots(1, 1, figsize=(9, 8))
     plot_series(ax, gnss, "east_m", "north_m", "GNSS stream", "blue")
-    plot_series(ax, ekf, "east_m", "north_m", "EKF position", "red", every=2)
+    plot_series(ax, ekf, "east_m", "north_m", "EKF position", "red")
     ax.set_title("SensorConnect position overlay, equal meter scale")
     ax.set_xlabel("east from shared origin (m)")
     ax.set_ylabel("north from shared origin (m)")
@@ -263,15 +430,15 @@ def plot_outputs(ekf, imu, gnss, aid, output_dir, stamp):
 
     fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
     plot_series(axes[0], gnss, "x_time_s", "north_m", "GNSS north", "blue")
-    plot_series(axes[0], ekf, "x_time_s", "north_m", "EKF north", "red", every=2)
+    plot_series(axes[0], ekf, "x_time_s", "north_m", "EKF north", "red")
     axes[0].set_ylabel("north (m)")
     axes[0].set_title("North position")
     plot_series(axes[1], gnss, "x_time_s", "east_m", "GNSS east", "blue")
-    plot_series(axes[1], ekf, "x_time_s", "east_m", "EKF east", "red", every=2)
+    plot_series(axes[1], ekf, "x_time_s", "east_m", "EKF east", "red")
     axes[1].set_ylabel("east (m)")
     axes[1].set_title("East position")
     plot_series(axes[2], gnss, "x_time_s", "ellipsoid_height_m", "GNSS height", "blue")
-    plot_series(axes[2], ekf, "x_time_s", "ellipsoid_height_m", "EKF height", "red", every=2)
+    plot_series(axes[2], ekf, "x_time_s", "ellipsoid_height_m", "EKF height", "red")
     axes[2].set_ylabel("height (m)")
     axes[2].set_title("Height")
     axes[2].set_xlabel("time from first sample (s)")
@@ -283,16 +450,16 @@ def plot_outputs(ekf, imu, gnss, aid, output_dir, stamp):
 
     fig, axes = plt.subplots(4, 1, figsize=(13, 10), sharex=True)
     plot_series(axes[0], gnss, "x_time_s", "heading_deg", "GNSS course/heading", "blue")
-    plot_series(axes[0], ekf, "x_time_s", "yaw_deg", "EKF yaw", "red", every=2)
+    plot_series(axes[0], ekf, "x_time_s", "yaw_deg", "EKF yaw", "red")
     axes[0].set_ylabel("deg")
     axes[0].set_title("Heading / yaw")
-    plot_series(axes[1], ekf, "x_time_s", "roll_deg", "EKF roll", "red", every=2)
+    plot_series(axes[1], ekf, "x_time_s", "roll_deg", "EKF roll", "red")
     axes[1].set_ylabel("deg")
     axes[1].set_title("Roll")
-    plot_series(axes[2], ekf, "x_time_s", "pitch_deg", "EKF pitch", "red", every=2)
+    plot_series(axes[2], ekf, "x_time_s", "pitch_deg", "EKF pitch", "red")
     axes[2].set_ylabel("deg")
     axes[2].set_title("Pitch")
-    plot_series(axes[3], ekf, "x_time_s", "yaw_uncert_deg", "EKF yaw uncertainty", "purple", every=2)
+    plot_series(axes[3], ekf, "x_time_s", "yaw_uncert_deg", "EKF yaw uncertainty", "purple")
     axes[3].set_ylabel("deg")
     axes[3].set_title("Yaw uncertainty")
     axes[3].set_xlabel("time from first sample (s)")
@@ -358,6 +525,9 @@ def main():
     aid.to_csv(output_dir / f"sensorconnect_aid_summary_{stamp}.csv", index=False)
 
     print("Rows:", {"ekf": len(ekf), "imu": len(imu), "gnss": len(gnss), "system": len(system), "aid": len(aid)})
+    if not imu.empty and "fields" in imu.columns:
+        print("IMU fields:")
+        print(imu["fields"].value_counts(dropna=False).to_string())
     if not ekf.empty and "filter_state_name" in ekf.columns:
         print("EKF states:")
         print(ekf["filter_state_name"].value_counts(dropna=False).to_string())
