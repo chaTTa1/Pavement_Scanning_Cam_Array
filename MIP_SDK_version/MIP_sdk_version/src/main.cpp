@@ -69,6 +69,11 @@ static constexpr bool USE_GPS_TIME_NANOSECONDS = true;
 static constexpr uint32_t INVALID_GNSS_TOW_MS = 0xFFFFFFFFu;
 static constexpr uint32_t HEADING_MAX_TOW_DELTA_MS = 200u;
 
+// Keep external GNSS velocity aiding enabled, but mirror the exact aiding values
+// sent to the CV7 as CSV over USB debug output for audit/comparison with NMEA.
+static constexpr bool SEND_VELOCITY_AIDING = true;
+static constexpr bool PRINT_AIDING_CSV_TO_USB = DEBUG_MODE;
+
 // CV7 aiding frame ID (we define this; any value 1..255 works)
 static constexpr uint8_t AIDING_FRAME_ID = 1;
 
@@ -171,6 +176,8 @@ struct AttSnap {
 };
 struct AttCovSnap {
     bool valid = false;
+    uint32_t tow_ms = 0;
+    uint8_t err = 0;
     float std_heading = 0, std_pitch = 0, std_roll = 0;
 };
 
@@ -189,6 +196,8 @@ static uint16_t last_gps_time_update_week = 0xFFFFu;
 static uint32_t last_gps_time_update_tow_s = 0xFFFFFFFFu;
 static uint16_t last_pos_valid_flags = 0;
 static uint16_t last_vel_valid_flags = 0;
+
+static void print_aiding_csv_row(const mip_time& t, uint16_t pos_flags, uint16_t vel_flags);
 
 static uint32_t cv7_ack_total = 0;
 static uint32_t cv7_nack_total = 0;
@@ -427,13 +436,15 @@ static void parse_att_euler(const uint8_t* blk, uint16_t) {
     memcpy(&s.heading_deg, blk + 20, 4);
     memcpy(&s.pitch_deg,   blk + 24, 4);
     memcpy(&s.roll_deg,    blk + 28, 4);
-    s.valid = (s.err == 0) && !is_dnu_f(s.heading_deg);
+    s.valid = (s.err == 0) && (s.mode >= 1 && s.mode <= 4) && !is_dnu_f(s.heading_deg);
     att = s;
     cnt_att++;
 }
 
 static void parse_att_cov_euler(const uint8_t* blk, uint16_t) {
     AttCovSnap s;
+    memcpy(&s.tow_ms, blk + 8, 4);
+    s.err = blk[15];
     float var_h, var_p, var_r;
     memcpy(&var_h, blk + 16, 4);
     memcpy(&var_p, blk + 20, 4);
@@ -441,7 +452,7 @@ static void parse_att_cov_euler(const uint8_t* blk, uint16_t) {
     s.std_heading = (var_h > 0 && !is_dnu_f(var_h)) ? sqrtf(var_h) : 0.0f;
     s.std_pitch   = (var_p > 0 && !is_dnu_f(var_p)) ? sqrtf(var_p) : 0.0f;
     s.std_roll    = (var_r > 0 && !is_dnu_f(var_r)) ? sqrtf(var_r) : 0.0f;
-    s.valid = !is_dnu_f(var_h);
+    s.valid = (s.err == 0) && !is_dnu_f(var_h);
     acv = s;
     cnt_attcov++;
 }
@@ -716,7 +727,7 @@ static void try_send_mip() {
     }
 
     // --- Field 2: External Velocity NED (0x29) ---
-    {
+    if (SEND_VELOCITY_AIDING) {
         mip_aiding_vel_ned_command cmd;
         memset(&cmd, 0, sizeof(cmd));
         cmd.time = t;
@@ -744,12 +755,17 @@ static void try_send_mip() {
         }
     }
 
+    print_aiding_csv_row(t, last_pos_valid_flags, last_vel_valid_flags);
+
     // --- Field 3: External Heading True (0x31) ---
     //     Sent when dual-antenna attitude is valid and close to this GNSS epoch.
     const bool heading_tow_valid = att.tow_ms != INVALID_GNSS_TOW_MS && pvt.tow_ms != INVALID_GNSS_TOW_MS;
     const bool heading_tow_close = heading_tow_valid
                                 && tow_abs_delta_ms(att.tow_ms, pvt.tow_ms) <= HEADING_MAX_TOW_DELTA_MS;
-    if (att.valid && acv.valid && acv.std_heading > 0.0f && heading_tow_close
+    const bool heading_cov_tow_close = acv.tow_ms != INVALID_GNSS_TOW_MS
+                                    && att.tow_ms != INVALID_GNSS_TOW_MS
+                                    && tow_abs_delta_ms(acv.tow_ms, att.tow_ms) <= HEADING_MAX_TOW_DELTA_MS;
+    if (att.valid && acv.valid && acv.std_heading > 0.0f && heading_tow_close && heading_cov_tow_close
             && att.tow_ms != last_heading_mip_tow) {
         mip_time heading_time = t;
         heading_time.nanoseconds = USE_GPS_TIME_NANOSECONDS ? gps_time_ns(pvt.week, att.tow_ms) : 0ULL;
@@ -856,6 +872,7 @@ static uint32_t last_mip_count = 0;
 static uint32_t last_pps_count = 0;
 static uint32_t last_cv7_ack_count = 0;
 static uint32_t last_cv7_nack_count = 0;
+static bool aiding_csv_header_printed = false;
 
 static const char* mode_name(uint8_t m) {
     switch (m) {
@@ -870,6 +887,91 @@ static const char* mode_name(uint8_t m) {
         case 8: return "moving-base RTK Float";
         default: return "?";
     }
+}
+
+static void print_aiding_csv_header_once() {
+    if (!PRINT_AIDING_CSV_TO_USB || aiding_csv_header_printed) {
+        return;
+    }
+    Serial.println(F(
+        "TEENSY_GPS_AID_HEADER,"
+        "teensy_ms,gps_week,tow_ms,mode,num_sats,"
+        "lat_deg,lon_deg,height_m,"
+        "vel_n_mps,vel_e_mps,vel_d_mps,"
+        "pos_sigma_n_m,pos_sigma_e_m,pos_sigma_u_m,"
+        "vel_sigma_n_mps,vel_sigma_e_mps,vel_sigma_d_mps,"
+        "pos_valid_flags_hex,vel_valid_flags_hex,"
+        "heading_valid,heading_tow_ms,heading_deg,heading_sigma_deg,"
+        "att_mode,att_error,att_num_sats,att_cov_valid,att_cov_tow_ms,att_cov_error"
+    ));
+    aiding_csv_header_printed = true;
+}
+
+static void print_aiding_csv_row(const mip_time& t, uint16_t pos_flags, uint16_t vel_flags) {
+    if (!PRINT_AIDING_CSV_TO_USB) {
+        return;
+    }
+    print_aiding_csv_header_once();
+    Serial.print(F("TEENSY_GPS_AID,"));
+    Serial.print(millis());
+    Serial.print(',');
+    Serial.print(pvt.week);
+    Serial.print(',');
+    Serial.print(pvt.tow_ms);
+    Serial.print(',');
+    Serial.print(pvt.mode);
+    Serial.print(',');
+    Serial.print(pvt.num_sats);
+    Serial.print(',');
+    Serial.print(pvt.lat_deg, 10);
+    Serial.print(',');
+    Serial.print(pvt.lon_deg, 10);
+    Serial.print(',');
+    Serial.print(pvt.h_m, 4);
+    Serial.print(',');
+    Serial.print(pvt.vn, 6);
+    Serial.print(',');
+    Serial.print(pvt.ve, 6);
+    Serial.print(',');
+    Serial.print(-pvt.vu, 6);
+    Serial.print(',');
+    Serial.print(pcv.std_n, 4);
+    Serial.print(',');
+    Serial.print(pcv.std_e, 4);
+    Serial.print(',');
+    Serial.print(pcv.std_u, 4);
+    Serial.print(',');
+    Serial.print(vcv.std_vn, 4);
+    Serial.print(',');
+    Serial.print(vcv.std_ve, 4);
+    Serial.print(',');
+    Serial.print(vcv.std_vu, 4);
+    Serial.print(F(",0x"));
+    Serial.print(pos_flags, HEX);
+    Serial.print(F(",0x"));
+    Serial.print(vel_flags, HEX);
+    Serial.print(',');
+    Serial.print(att.valid ? 1 : 0);
+    Serial.print(',');
+    Serial.print(att.tow_ms);
+    Serial.print(',');
+    Serial.print(att.heading_deg, 6);
+    Serial.print(',');
+    Serial.print(acv.valid ? acv.std_heading : 0.0f, 6);
+    Serial.print(',');
+    Serial.print(att.mode);
+    Serial.print(',');
+    Serial.print(att.err);
+    Serial.print(',');
+    Serial.print(att.nr_sv);
+    Serial.print(',');
+    Serial.print(acv.valid ? 1 : 0);
+    Serial.print(',');
+    Serial.print(acv.tow_ms);
+    Serial.print(',');
+    Serial.print(acv.err);
+    Serial.println();
+    (void)t;
 }
 
 static void print_status() {
@@ -943,6 +1045,12 @@ static void print_status() {
             Serial.print(F("  sigma="));
             Serial.print(acv.std_heading, 2); Serial.print(F(" deg"));
         }
+        Serial.print(F("  AttCov TOW="));
+        Serial.print(acv.tow_ms / 1000.0, 3);
+        Serial.print(F(" err="));
+        Serial.print(acv.err);
+        Serial.print(F(" valid="));
+        Serial.print(acv.valid ? F("yes") : F("no"));
         Serial.println();
     }
     if (DEBUG_MODE) {

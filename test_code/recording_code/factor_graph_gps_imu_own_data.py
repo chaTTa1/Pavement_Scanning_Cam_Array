@@ -360,6 +360,14 @@ def merge_gravity_and_quat(imu_raw, imu_gravity, imu_quat):
 
 
 def add_enu_acceleration(imu: pd.DataFrame) -> pd.DataFrame:
+    precomputed_cols = ["acc_e", "acc_n", "acc_u"]
+    if all(col in imu.columns for col in precomputed_cols):
+        for col in precomputed_cols:
+            imu[col] = pd.to_numeric(imu[col], errors="coerce")
+        if imu[precomputed_cols].notna().all(axis=1).any():
+            print("[INFO] Using precomputed ENU acceleration from imu_raw.csv.")
+            return imu
+
     acc_body = imu[["accel_x_g", "accel_y_g", "accel_z_g"]].values.astype(float)
     grav_body = imu[["gravity_x_g", "gravity_y_g", "gravity_z_g"]].values.astype(float)
     lin_body = (acc_body - grav_body) * GRAVITY_MPS2

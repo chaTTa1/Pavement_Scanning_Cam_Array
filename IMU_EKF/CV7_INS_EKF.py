@@ -45,6 +45,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -63,9 +64,11 @@ USE_SPYDER_SETTINGS_WHEN_AVAILABLE = True
 # Set to your actual COM port, for example "COM5". Leave as None for auto-detect.
 SPYDER_PORT: Optional[str] = "COM13"
 SPYDER_GPS_PORT: Optional[str] = None  # None means auto-detect GPS NMEA port when CSV recording is enabled.
+SPYDER_TEENSY_PORT: Optional[str] = None  # Teensy USB debug port. Used only with --debug/CSV recording.
 
 SPYDER_BAUD = 115200
 SPYDER_GPS_BAUD = 115200
+SPYDER_TEENSY_BAUD = 115200
 SPYDER_DEBUG = False
 
 # True: ask the CV7 to stream the needed MIP fields before reading.
@@ -239,6 +242,11 @@ GPS_FIX_QUALITY_NAMES = {
 }
 
 GPS_NMEA_SENTENCE_TYPES = ("GGA", "GST", "HDT", "RMC", "VTG", "ZDA", "GSV", "GSA")
+
+# GPS time is ahead of UTC by the leap-second offset. Update this constant if a
+# future leap-second table changes.
+GPS_UTC_LEAP_SECONDS = 18
+GPS_EPOCH_UTC = datetime(1980, 1, 6, tzinfo=timezone.utc)
 
 PPS_SOURCE_NAMES = {
     0: "disabled",
@@ -1179,12 +1187,12 @@ def parse_initialization_configuration(payload: bytes) -> Dict:
         }.get(initial_source, "unknown"),
         "auto_heading_alignment_selector": alignment_selector,
         "auto_heading_alignment_names": alignment_selector_names(alignment_selector),
-        "initial_heading_rad": heading,
-        "initial_heading_deg": rad_to_deg(heading),
-        "initial_pitch_rad": pitch,
-        "initial_pitch_deg": rad_to_deg(pitch),
-        "initial_roll_rad": roll,
-        "initial_roll_deg": rad_to_deg(roll),
+        "initial_heading_deg": heading,
+        "initial_heading_rad": math.radians(heading),
+        "initial_pitch_deg": pitch,
+        "initial_pitch_rad": math.radians(pitch),
+        "initial_roll_deg": roll,
+        "initial_roll_rad": math.radians(roll),
         "initial_position": {
             "x_or_lat": position[0],
             "y_or_lon": position[1],
@@ -1220,10 +1228,9 @@ def read_initialization_configuration(
 
 
 def make_user_heading_initialization_payload(heading_deg: float) -> bytes:
-    heading_rad = math.radians(heading_deg)
     return (
         bytes((MIP_FUNCTION_WRITE, 0x00, 0x01, 0x00))
-        + struct.pack(">fff", heading_rad, 0.0, 0.0)
+        + struct.pack(">fff", heading_deg, 0.0, 0.0)
         + struct.pack(">fff", 0.0, 0.0, 0.0)
         + struct.pack(">fff", 0.0, 0.0, 0.0)
         + bytes((0x02,))
@@ -1976,17 +1983,32 @@ def configure_streams(
         0x02,
         0x05,
     ]
+    sensorconnect_csv_filter_fields = [
+        0xD3,
+        0xD5,
+        0x01,
+        0x02,
+        0x05,
+        0x06,
+        0x07,
+        0x08,
+        0x09,
+        0x0A,
+        0x0B,
+        0x0C,
+        0x10,
+        0x40,
+        0x41,
+        0x42,
+        0x46,
+    ]
     csv_filter_fields = core_filter_fields + [
         0x08,
         0x09,
         0x0A,
-        0x43,
-        0x44,
-        0x45,
         0x46,
         0xD3,
         0xD5,
-        0xD7,
     ]
     full_filter_fields = core_filter_fields + [
         0x03,
@@ -2010,10 +2032,11 @@ def configure_streams(
     if stream_preset == "core":
         filter_field_candidates = [core_filter_fields]
     elif stream_preset == "csv":
-        filter_field_candidates = [csv_filter_fields, core_filter_fields]
+        filter_field_candidates = [sensorconnect_csv_filter_fields, csv_filter_fields, core_filter_fields]
     else:
         filter_field_candidates = [
             full_filter_fields,
+            sensorconnect_csv_filter_fields,
             csv_filter_fields,
             core_filter_fields,
         ]
@@ -2027,8 +2050,29 @@ def configure_streams(
                 CMD_3DM_MESSAGE_FORMAT,
                 make_message_format_payload(DESC_FILTER, filter_fields, decimation),
             )
+            print(
+                json.dumps(
+                    {
+                        "event": "filter_stream_format_selected",
+                        "fields": [f"0x{field:02X}" for field in filter_fields],
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
             break
         except MipError as exc:
+            print(
+                json.dumps(
+                    {
+                        "event": "filter_stream_format_rejected",
+                        "fields": [f"0x{field:02X}" for field in filter_fields],
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
             last_format_error = exc
     else:
         assert last_format_error is not None
@@ -2186,6 +2230,21 @@ def summarize_decoded_fields(decoded_items: List[Dict]) -> Optional[Dict]:
             summary["gps_fix_type"] = item.get("fix_type_name")
             summary["gps_num_sv"] = item.get("num_sv")
             found = True
+        elif field == "aid_measurement_summary":
+            meas_name = str(item.get("measurement_type_name") or "")
+            prefixes = {
+                "aiding_pos_llh": "aid_pos_llh",
+                "aiding_vel_ned": "aid_vel_ned",
+                "aiding_heading_true": "aid_heading_true",
+            }
+            prefix = prefixes.get(meas_name)
+            if prefix:
+                summary[f"{prefix}_enabled"] = item.get("enabled")
+                summary[f"{prefix}_used"] = item.get("used")
+                summary[f"{prefix}_indicator_hex"] = item.get("indicator_hex")
+                summary[f"{prefix}_sample_time_warning"] = item.get("sample_time_warning")
+                summary[f"{prefix}_configuration_error"] = item.get("configuration_error")
+                found = True
 
     return summary if found else None
 
@@ -2236,6 +2295,21 @@ EKF_CSV_FIELDS = [
     "relative_n_m",
     "relative_e_m",
     "relative_d_m",
+    "aid_pos_llh_enabled",
+    "aid_pos_llh_used",
+    "aid_pos_llh_sample_time_warning",
+    "aid_pos_llh_configuration_error",
+    "aid_pos_llh_indicator_hex",
+    "aid_vel_ned_enabled",
+    "aid_vel_ned_used",
+    "aid_vel_ned_sample_time_warning",
+    "aid_vel_ned_configuration_error",
+    "aid_vel_ned_indicator_hex",
+    "aid_heading_true_enabled",
+    "aid_heading_true_used",
+    "aid_heading_true_sample_time_warning",
+    "aid_heading_true_configuration_error",
+    "aid_heading_true_indicator_hex",
     "decoded_json",
 ]
 
@@ -2315,6 +2389,52 @@ GPS_CSV_FIELDS = [
     "antenna_power",
     "valid_flags",
     "raw_fields_json",
+    "decoded_json",
+]
+
+TEENSY_AID_CSV_FIELDS = [
+    "host_time_unix_s",
+    "sample_time_source",
+    "sample_time_s",
+    "skip_detected",
+    "skip_count_estimate",
+    "gap_s",
+    "expected_period_s",
+    "port",
+    "baud",
+    "line_index",
+    "raw_line",
+    "fields",
+    "teensy_ms",
+    "gps_week",
+    "tow_ms",
+    "gps_tow_s",
+    "mode",
+    "num_sats",
+    "latitude_deg",
+    "longitude_deg",
+    "height_m",
+    "vel_n_mps",
+    "vel_e_mps",
+    "vel_d_mps",
+    "pos_sigma_n_m",
+    "pos_sigma_e_m",
+    "pos_sigma_u_m",
+    "vel_sigma_n_mps",
+    "vel_sigma_e_mps",
+    "vel_sigma_d_mps",
+    "pos_valid_flags_hex",
+    "vel_valid_flags_hex",
+    "heading_valid",
+    "heading_tow_ms",
+    "heading_deg",
+    "heading_sigma_deg",
+    "att_mode",
+    "att_error",
+    "att_num_sats",
+    "att_cov_valid",
+    "att_cov_tow_ms",
+    "att_cov_error",
     "decoded_json",
 ]
 
@@ -2498,6 +2618,84 @@ def combine_gps_datetime(date_text: str, time_text: str) -> str:
     if not date_text or not time_text:
         return ""
     return f"{date_text}T{time_text}Z"
+
+
+def parse_nmea_datetime_utc(date_text: str, time_text: str) -> Optional[datetime]:
+    if not date_text or not time_text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(f"{date_text}T{time_text}")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def format_datetime_utc(dt_utc: datetime) -> str:
+    text = dt_utc.isoformat(timespec="milliseconds")
+    return text.replace("+00:00", "Z")
+
+
+def utc_datetime_to_gps_week_tow(
+    dt_utc: datetime,
+    leap_seconds: int = GPS_UTC_LEAP_SECONDS,
+) -> Tuple[int, float]:
+    gps_time = dt_utc + timedelta(seconds=leap_seconds)
+    total_seconds = (gps_time - GPS_EPOCH_UTC).total_seconds()
+    gps_week = int(total_seconds // (7 * 24 * 3600))
+    gps_tow_s = total_seconds - gps_week * 7 * 24 * 3600
+    return gps_week, gps_tow_s
+
+
+@dataclass
+class NmeaGpsTimeState:
+    leap_seconds: int = GPS_UTC_LEAP_SECONDS
+    last_date_text: str = ""
+    last_datetime_utc: Optional[datetime] = None
+
+    def apply(self, row: Dict[str, object]) -> None:
+        date_text = str(row.get("nmea_date") or "").strip()
+        time_text = str(row.get("nmea_time_utc") or "").strip()
+
+        if date_text:
+            self.last_date_text = date_text
+        elif self.last_date_text:
+            date_text = self.last_date_text
+            row["nmea_date"] = date_text
+
+        if not time_text and self.last_datetime_utc is not None:
+            gps_week, gps_tow_s = utc_datetime_to_gps_week_tow(
+                self.last_datetime_utc,
+                self.leap_seconds,
+            )
+            row["gps_week"] = gps_week
+            row["gps_tow_s"] = gps_tow_s
+            if not row.get("gps_datetime_utc"):
+                row["gps_datetime_utc"] = format_datetime_utc(self.last_datetime_utc)
+            return
+
+        if not date_text or not time_text:
+            return
+
+        dt_utc = parse_nmea_datetime_utc(date_text, time_text)
+        if dt_utc is None:
+            return
+
+        # If a time-only sentence crosses UTC midnight before the next RMC/ZDA,
+        # keep it monotonic by rolling the cached date forward/backward.
+        if row.get("message_type") not in ("RMC", "ZDA") and self.last_datetime_utc is not None:
+            if dt_utc < self.last_datetime_utc - timedelta(hours=12):
+                dt_utc += timedelta(days=1)
+            elif dt_utc > self.last_datetime_utc + timedelta(hours=12):
+                dt_utc -= timedelta(days=1)
+            date_text = dt_utc.date().isoformat()
+            row["nmea_date"] = date_text
+
+        gps_week, gps_tow_s = utc_datetime_to_gps_week_tow(dt_utc, self.leap_seconds)
+        row["gps_week"] = gps_week
+        row["gps_tow_s"] = gps_tow_s
+        if not row.get("gps_datetime_utc"):
+            row["gps_datetime_utc"] = format_datetime_utc(dt_utc)
+        self.last_datetime_utc = dt_utc
 
 
 def parse_external_gps_nmea(
@@ -2717,12 +2915,14 @@ class CsvRecorder:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         self.ekf_path = os.path.join(output_dir, f"{prefix}_ekf_fused_{stamp}.csv")
         self.gps_path = os.path.join(output_dir, f"{prefix}_gps_raw_{stamp}.csv")
+        self.teensy_aid_path = os.path.join(output_dir, f"{prefix}_teensy_gps_aid_{stamp}.csv")
         self.imu_path = os.path.join(output_dir, f"{prefix}_imu_sensor_{stamp}.csv")
         self.system_path = os.path.join(output_dir, f"{prefix}_system_{stamp}.csv")
         self.skip_path = os.path.join(output_dir, f"{prefix}_skip_validation_{stamp}.csv")
         self.expected_periods = {
             "EKF": 1.0 / expected_ekf_hz if expected_ekf_hz > 0 else 0.0,
             "GPS": 1.0 / expected_gps_hz if expected_gps_hz > 0 else 0.0,
+            "TEENSY_AID": 1.0 / expected_gps_hz if expected_gps_hz > 0 else 0.0,
             "IMU": 1.0 / expected_ekf_hz if expected_ekf_hz > 0 else 0.0,
             "SYSTEM": 1.0 / min(expected_ekf_hz, 10.0) if expected_ekf_hz > 0 else 0.0,
         }
@@ -2733,23 +2933,37 @@ class CsvRecorder:
 
         self._ekf_file = open(self.ekf_path, "w", newline="", encoding="utf-8")
         self._gps_file = open(self.gps_path, "w", newline="", encoding="utf-8")
+        self._teensy_aid_file = open(self.teensy_aid_path, "w", newline="", encoding="utf-8")
         self._imu_file = open(self.imu_path, "w", newline="", encoding="utf-8")
         self._system_file = open(self.system_path, "w", newline="", encoding="utf-8")
         self._skip_file = open(self.skip_path, "w", newline="", encoding="utf-8")
         self.ekf_writer = csv.DictWriter(self._ekf_file, fieldnames=EKF_CSV_FIELDS, extrasaction="ignore")
         self.gps_writer = csv.DictWriter(self._gps_file, fieldnames=GPS_CSV_FIELDS, extrasaction="ignore")
+        self.teensy_aid_writer = csv.DictWriter(
+            self._teensy_aid_file,
+            fieldnames=TEENSY_AID_CSV_FIELDS,
+            extrasaction="ignore",
+        )
         self.imu_writer = csv.DictWriter(self._imu_file, fieldnames=IMU_CSV_FIELDS, extrasaction="ignore")
         self.system_writer = csv.DictWriter(self._system_file, fieldnames=SYSTEM_CSV_FIELDS, extrasaction="ignore")
         self.skip_writer = csv.DictWriter(self._skip_file, fieldnames=SKIP_CSV_FIELDS, extrasaction="ignore")
         self.ekf_writer.writeheader()
         self.gps_writer.writeheader()
+        self.teensy_aid_writer.writeheader()
         self.imu_writer.writeheader()
         self.system_writer.writeheader()
         self.skip_writer.writeheader()
 
     def close(self) -> None:
         with self._lock:
-            for handle in (self._ekf_file, self._gps_file, self._imu_file, self._system_file, self._skip_file):
+            for handle in (
+                self._ekf_file,
+                self._gps_file,
+                self._teensy_aid_file,
+                self._imu_file,
+                self._system_file,
+                self._skip_file,
+            ):
                 handle.flush()
                 handle.close()
 
@@ -2810,6 +3024,16 @@ class CsvRecorder:
                 skip_rows = 1
             return 1, skip_rows
 
+    def record_teensy_aid(self, row: Dict[str, object]) -> Tuple[int, int]:
+        with self._lock:
+            skip = self._skip_row("TEENSY_AID", row)
+            self.teensy_aid_writer.writerow(row)
+            skip_rows = 0
+            if skip:
+                self.skip_writer.writerow(skip)
+                skip_rows = 1
+            return 1, skip_rows
+
     def _build_row(self, stream: str, items: List[Dict]) -> Dict:
         host_time = items[-1].get("host_time_unix_s")
         fields = ",".join(str(item.get("field", "")) for item in items)
@@ -2843,6 +3067,20 @@ class CsvRecorder:
             row["velocity_valid"] = item.get("valid_flags")
         elif field == "attitude_euler":
             row["attitude_valid"] = item.get("valid_flags")
+        elif field == "aid_measurement_summary":
+            meas_name = str(item.get("measurement_type_name") or "")
+            prefixes = {
+                "aiding_pos_llh": "aid_pos_llh",
+                "aiding_vel_ned": "aid_vel_ned",
+                "aiding_heading_true": "aid_heading_true",
+            }
+            prefix = prefixes.get(meas_name)
+            if prefix:
+                row[f"{prefix}_enabled"] = int(bool(item.get("enabled")))
+                row[f"{prefix}_used"] = int(bool(item.get("used")))
+                row[f"{prefix}_sample_time_warning"] = int(bool(item.get("sample_time_warning")))
+                row[f"{prefix}_configuration_error"] = int(bool(item.get("configuration_error")))
+                row[f"{prefix}_indicator_hex"] = item.get("indicator_hex")
 
     @staticmethod
     def _sample_time(stream: str, row: Dict) -> Tuple[str, Optional[float]]:
@@ -2850,6 +3088,8 @@ class CsvRecorder:
             return "reference_time_s", float(row["reference_time_s"])
         if row.get("gps_tow_s") is not None:
             return "gps_tow_s", float(row["gps_tow_s"])
+        if row.get("tow_ms") is not None:
+            return "tow_ms", float(row["tow_ms"]) / 1000.0
         if row.get("host_time_unix_s") is not None:
             return "host_time_unix_s", float(row["host_time_unix_s"])
         return "none", None
@@ -2900,6 +3140,7 @@ class CsvRecorder:
         with self._lock:
             self._ekf_file.flush()
             self._gps_file.flush()
+            self._teensy_aid_file.flush()
             self._imu_file.flush()
             self._system_file.flush()
             self._skip_file.flush()
@@ -2926,6 +3167,7 @@ class ExternalGpsReaderThread(threading.Thread):
         self.bad_checksum = 0
         self.open_error = ""
         self.last_error = ""
+        self.gps_time_state = NmeaGpsTimeState()
 
     def run(self) -> None:
         try:
@@ -2954,6 +3196,8 @@ class ExternalGpsReaderThread(threading.Thread):
                         continue
                     if row.get("checksum_present") and not row.get("checksum_ok"):
                         self.bad_checksum += 1
+                    else:
+                        self.gps_time_state.apply(row)
                     rows, skips = self.recorder.record_external_gps(row)
                     self.rows_written += rows
                     self.skip_rows += skips
@@ -2962,6 +3206,140 @@ class ExternalGpsReaderThread(threading.Thread):
             self.last_error = str(exc)
         except Exception as exc:
             self.last_error = str(exc)
+
+
+class ExternalTeensyAidingReaderThread(threading.Thread):
+    def __init__(
+        self,
+        port: str,
+        baud: int,
+        read_timeout_s: float,
+        recorder: CsvRecorder,
+        stop_event: threading.Event,
+    ):
+        super().__init__(daemon=True, name="ExternalTeensyAidingReader")
+        self.port = port
+        self.baud = baud
+        self.read_timeout_s = read_timeout_s
+        self.recorder = recorder
+        self.stop_event = stop_event
+        self.lines_read = 0
+        self.rows_written = 0
+        self.skip_rows = 0
+        self.open_error = ""
+        self.last_error = ""
+        self.header: List[str] = []
+
+    def run(self) -> None:
+        try:
+            with serial.Serial(port=self.port, baudrate=self.baud, timeout=self.read_timeout_s) as ser:
+                try:
+                    ser.set_buffer_size(rx_size=65536, tx_size=4096)
+                except Exception:
+                    pass
+                while not self.stop_event.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("ascii", errors="ignore").strip()
+                    if not line.startswith("TEENSY_GPS_AID"):
+                        continue
+
+                    self.lines_read += 1
+                    row = self._parse_teensy_aid_line(
+                        line=line,
+                        received_time=time.time(),
+                    )
+                    if row is None:
+                        continue
+                    rows, skips = self.recorder.record_teensy_aid(row)
+                    self.rows_written += rows
+                    self.skip_rows += skips
+        except serial.SerialException as exc:
+            self.open_error = str(exc)
+            self.last_error = str(exc)
+        except Exception as exc:
+            self.last_error = str(exc)
+
+    def _parse_teensy_aid_line(self, line: str, received_time: float) -> Optional[Dict[str, object]]:
+        parts = line.split(",")
+        prefix = parts[0]
+        values = parts[1:]
+        if prefix == "TEENSY_GPS_AID_HEADER":
+            self.header = values
+            return None
+        if prefix != "TEENSY_GPS_AID":
+            return None
+
+        header = self.header
+        if not header or len(header) != len(values):
+            header = [
+                "teensy_ms",
+                "gps_week",
+                "tow_ms",
+                "mode",
+                "num_sats",
+                "lat_deg",
+                "lon_deg",
+                "height_m",
+                "vel_n_mps",
+                "vel_e_mps",
+                "vel_d_mps",
+                "pos_sigma_n_m",
+                "pos_sigma_e_m",
+                "pos_sigma_u_m",
+                "vel_sigma_n_mps",
+                "vel_sigma_e_mps",
+                "vel_sigma_d_mps",
+                "pos_valid_flags_hex",
+                "vel_valid_flags_hex",
+                "heading_valid",
+                "heading_tow_ms",
+                "heading_deg",
+                "heading_sigma_deg",
+                "att_mode",
+                "att_error",
+                "att_num_sats",
+                "att_cov_valid",
+                "att_cov_tow_ms",
+                "att_cov_error",
+            ]
+        raw_items = dict(zip(header, values))
+
+        row: Dict[str, object] = {
+            "host_time_unix_s": received_time,
+            "port": self.port,
+            "baud": self.baud,
+            "line_index": self.lines_read,
+            "raw_line": line,
+            "fields": "teensy_gps_aid",
+            "decoded_json": json.dumps(raw_items, separators=(",", ":"), sort_keys=True),
+        }
+        alias_map = {
+            "lat_deg": "latitude_deg",
+            "lon_deg": "longitude_deg",
+        }
+        for key, value in raw_items.items():
+            out_key = alias_map.get(key, key)
+            if out_key.endswith("_hex"):
+                row[out_key] = value
+            else:
+                parsed_float = parse_float_maybe(value)
+                parsed_int = parse_int_maybe(value)
+                if parsed_int is not None and value.strip().isdigit():
+                    row[out_key] = parsed_int
+                elif parsed_float is not None:
+                    row[out_key] = parsed_float
+                else:
+                    row[out_key] = value
+
+        tow_ms = row.get("tow_ms")
+        if tow_ms is not None:
+            row["gps_tow_s"] = float(tow_ms) / 1000.0
+        sample_source, sample_time = CsvRecorder._sample_time("TEENSY_AID", row)
+        row["sample_time_source"] = sample_source
+        row["sample_time_s"] = sample_time
+        return row
 
 
 def print_decoded_items(decoded_items: List[Dict], pretty: bool, summary: bool) -> int:
@@ -3007,6 +3385,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--gps-baud", type=int, default=115200, help="External GPS NMEA serial baud rate.")
     parser.add_argument("--gps-read-timeout-s", type=float, default=0.25, help="External GPS serial read timeout.")
     parser.add_argument("--gps-auto-detect-s", type=float, default=3.0, help="Seconds to listen on each candidate GPS port during auto-detect.")
+    parser.add_argument(
+        "--teensy-port",
+        help=(
+            "Teensy USB debug serial port. With --debug and --record-csv, lines "
+            "prefixed TEENSY_GPS_AID are recorded to the teensy GPS aiding CSV."
+        ),
+    )
+    parser.add_argument("--teensy-baud", type=int, default=115200, help="Teensy USB debug serial baud rate.")
+    parser.add_argument("--teensy-read-timeout-s", type=float, default=0.25, help="Teensy USB serial read timeout.")
     parser.add_argument(
         "--status",
         action="store_true",
@@ -3105,6 +3492,8 @@ def build_argv_from_spyder_settings() -> List[str]:
         str(SPYDER_BAUD),
         "--gps-baud",
         str(SPYDER_GPS_BAUD),
+        "--teensy-baud",
+        str(SPYDER_TEENSY_BAUD),
         "--rate-hz",
         str(SPYDER_RATE_HZ),
         "--assume-base-rate-hz",
@@ -3130,6 +3519,8 @@ def build_argv_from_spyder_settings() -> List[str]:
         argv.extend(["--port", SPYDER_PORT])
     if SPYDER_GPS_PORT:
         argv.extend(["--gps-port", SPYDER_GPS_PORT])
+    if SPYDER_TEENSY_PORT:
+        argv.extend(["--teensy-port", SPYDER_TEENSY_PORT])
     if SPYDER_DEBUG:
         argv.append("--debug")
     if SPYDER_CONFIGURE:
@@ -3148,6 +3539,7 @@ def build_argv_from_spyder_settings() -> List[str]:
 def run_cv7_reader(
     port: Optional[str] = None,
     gps_port: Optional[str] = None,
+    teensy_port: Optional[str] = None,
     debug: bool = False,
     configure: bool = False,
     rate_hz: int = 100,
@@ -3155,6 +3547,7 @@ def run_cv7_reader(
     duration_s: float = 0.0,
     baud: int = 115200,
     gps_baud: int = 115200,
+    teensy_baud: int = 115200,
     pretty_json: bool = False,
     summary: bool = True,
     print_hz: float = 2.0,
@@ -3167,6 +3560,8 @@ def run_cv7_reader(
         str(baud),
         "--gps-baud",
         str(gps_baud),
+        "--teensy-baud",
+        str(teensy_baud),
         "--rate-hz",
         str(rate_hz),
         "--stream-preset",
@@ -3180,6 +3575,8 @@ def run_cv7_reader(
         argv.extend(["--port", port])
     if gps_port:
         argv.extend(["--gps-port", gps_port])
+    if teensy_port:
+        argv.extend(["--teensy-port", teensy_port])
     if debug:
         argv.append("--debug")
     if configure:
@@ -3237,6 +3634,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     os_name = platform.system()
     port = args.port or detect_serial_port()
     gps_port = args.gps_port
+    teensy_port = args.teensy_port
     gps_port_source = "command-line" if gps_port else "not_requested"
     if gps_port and gps_port.strip().lower() == "auto":
         gps_port = detect_gps_nmea_port(
@@ -3275,6 +3673,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "gps_port": gps_port,
                 "gps_port_source": gps_port_source,
                 "gps_baud": args.gps_baud,
+                "teensy_port": teensy_port,
+                "teensy_baud": args.teensy_baud,
                 "status": args.status,
                 "debug": args.debug,
                 "configure": args.configure,
@@ -3309,7 +3709,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             pretty=args.pretty,
         )
 
-    if args.init_heading_deg is not None or args.reset_filter or args.run_filter:
+    filter_control_requested = (
+        args.init_heading_deg is not None or args.reset_filter or args.run_filter
+    )
+    continue_after_filter_control = (
+        args.configure or args.record_csv or args.debug or args.summary or args.print_hz > 0
+    )
+    if filter_control_requested and not continue_after_filter_control:
         return run_filter_control_commands(
             port=port,
             baud=args.baud,
@@ -3322,7 +3728,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     recorder: Optional[CsvRecorder] = None
     gps_stop_event = threading.Event()
+    teensy_stop_event = threading.Event()
     gps_thread: Optional[ExternalGpsReaderThread] = None
+    teensy_thread: Optional[ExternalTeensyAidingReaderThread] = None
     if args.record_csv:
         output_dir = os.path.dirname(os.path.abspath(__file__))
         recorder = CsvRecorder(
@@ -3339,11 +3747,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "event": "csv_recording",
                     "ekf_csv": recorder.ekf_path,
                     "gps_csv": recorder.gps_path,
+                    "teensy_gps_aid_csv": recorder.teensy_aid_path,
                     "imu_csv": recorder.imu_path,
                     "system_csv": recorder.system_path,
                     "skip_csv": recorder.skip_path,
                     "external_gps_port": gps_port,
                     "external_gps_port_source": gps_port_source,
+                    "teensy_port": teensy_port,
                 },
                 sort_keys=True,
             ),
@@ -3365,6 +3775,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     ekf_rows = 0
     gps_rows = 0
+    teensy_aid_rows = 0
     imu_rows = 0
     system_rows = 0
     skip_rows = 0
@@ -3412,6 +3823,77 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "assume_base_rate_hz": args.assume_base_rate_hz,
                             "stream_preset": args.stream_preset,
                             "debug_streams": args.debug,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            if filter_control_requested:
+                filter_control_steps: List[Dict] = []
+                if args.init_heading_deg is not None:
+                    filter_control_steps.extend(
+                        send_user_heading_initialization_on_serial(
+                            ser,
+                            reader,
+                            args.status_timeout_s,
+                            args.init_heading_deg,
+                        )
+                    )
+                    time.sleep(0.1)
+                if args.reset_filter or args.run_filter:
+                    filter_control_steps.extend(
+                        send_filter_control_commands_on_serial(
+                            ser,
+                            reader,
+                            args.status_timeout_s,
+                            args.reset_filter,
+                            args.run_filter,
+                        )
+                    )
+                    time.sleep(0.5)
+                print(
+                    json.dumps(
+                        {
+                            "event": "filter_control",
+                            "port": port,
+                            "baud": args.baud,
+                            "init_heading_deg": args.init_heading_deg,
+                            "reset_filter": args.reset_filter,
+                            "run_filter": args.run_filter,
+                            "steps": filter_control_steps,
+                            "continue_recording": True,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            if recorder and args.debug and teensy_port:
+                teensy_thread = ExternalTeensyAidingReaderThread(
+                    port=teensy_port,
+                    baud=args.teensy_baud,
+                    read_timeout_s=args.teensy_read_timeout_s,
+                    recorder=recorder,
+                    stop_event=teensy_stop_event,
+                )
+                teensy_thread.start()
+                print(
+                    json.dumps(
+                        {
+                            "event": "teensy_gps_aid_recording_started",
+                            "teensy_port": teensy_port,
+                            "teensy_baud": args.teensy_baud,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+            elif recorder and teensy_port and not args.debug:
+                print(
+                    json.dumps(
+                        {
+                            "event": "teensy_gps_aid_not_recorded",
+                            "reason": "--teensy-port requires --debug and --record-csv",
+                            "teensy_port": teensy_port,
                         },
                         sort_keys=True,
                     ),
@@ -3474,8 +3956,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps({"event": "interrupted_by_user"}, sort_keys=True), file=sys.stderr)
         finally:
             gps_stop_event.set()
+            teensy_stop_event.set()
             if gps_thread:
                 gps_thread.join(timeout=2.0)
+            if teensy_thread:
+                teensy_thread.join(timeout=2.0)
             if recorder:
                 recorder.flush()
 
@@ -3487,6 +3972,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "decoded_fields": decoded_fields,
                 "ekf_csv_rows": ekf_rows,
                 "gps_csv_rows": gps_rows,
+                "teensy_gps_aid_csv_rows": teensy_thread.rows_written if teensy_thread else teensy_aid_rows,
+                "teensy_gps_aid_lines": teensy_thread.lines_read if teensy_thread else 0,
+                "teensy_gps_aid_skip_events": teensy_thread.skip_rows if teensy_thread else 0,
+                "teensy_gps_aid_error": teensy_thread.last_error if teensy_thread else "",
                 "imu_csv_rows": imu_rows,
                 "system_csv_rows": system_rows,
                 "external_gps_csv_rows": gps_thread.rows_written if gps_thread else 0,
@@ -3494,7 +3983,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "external_gps_bad_checksum": gps_thread.bad_checksum if gps_thread else 0,
                 "external_gps_skip_events": gps_thread.skip_rows if gps_thread else 0,
                 "external_gps_error": gps_thread.last_error if gps_thread else "",
-                "skip_events": skip_rows + (gps_thread.skip_rows if gps_thread else 0),
+                "skip_events": (
+                    skip_rows
+                    + (gps_thread.skip_rows if gps_thread else 0)
+                    + (teensy_thread.skip_rows if teensy_thread else 0)
+                ),
             },
             sort_keys=True,
         ),
