@@ -72,7 +72,7 @@ LOG_PORT = 6000
 log_sock = None
 
 def connect_log_socket():
-    global log_sok
+    global log_sock
     try:
         log_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         log_sock.connect((LOG_HOST, LOG_PORT))
@@ -107,12 +107,14 @@ def stats_thread(stop_event):
         prev_encode = enc
         prev_send = snd
         remote_print(
-            f"[FPS] "
-            f"capture={cap_fps} "
-            f"encode={enc_fps} "
-            f"send={snd_fps} "
-            f"save_q={save_q.qsize()} "
-            f"stream_q={stream_q.qsize()}"
+            f"[FPS], "
+            f"capture={cap_fps}, "
+            f"encode={enc_fps}, "
+            f"send={snd_fps}, "
+            f"save_q={save_q.qsize()}, "
+            f"stream_q={stream_q.qsize()}, "
+            f"exif_q={exif_q.qsize()}, "
+            f"time_q={time_q.qsize()}"
             )
 
 def drop_oldest_and_put(q, item, label):
