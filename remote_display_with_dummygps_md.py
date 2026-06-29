@@ -81,7 +81,7 @@ def stat_thread(STAT_PORT, label):
     stat_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     stat_server.bind((LISTEN_IP, STAT_PORT))
     stat_server.listen(5)
-    conn, addr = stat_server.accecpt()
+    conn, addr = stat_server.accept()
     print('connected:', addr)
     buffer = ""
     while not stop_event.is_set():
@@ -585,29 +585,29 @@ def main():
                 pass
             
             left_text = 'left camera'
-            l_capture = l_capt
-            l_encode = l_enc
-            l_sent = l_send
-            l_streamq = l_stream
-            l_saveq = l_save
-            l_timeq = l_time
-            l_exifq = l_exif
+            l_capture = f"capture: {l_capt} FPS"
+            l_encode = f"encode: {l_enc} FPS"
+            l_sent = f"send: {l_send} FPS"
+            l_streamq = f"stream_q: {l_stream} frames"
+            l_saveq = f"save_q: {l_save} frames"
+            l_timeq = f"time_q: {l_time} timestamps"
+            l_exifq = f"exif_q: {l_exif} arrays"
             mid_text = 'mid camera'
-            m_capture = m_capt
-            m_encode = m_enc
-            m_sent = m_send
-            m_streamq = m_stream
-            m_saveq = m_save
-            m_timeq = m_time
-            m_exifq = m_exif
+            m_capture = f"capture: {m_capt} FPS"
+            m_encode = f"encode: {m_enc} FPS"
+            m_sent = f"send: {m_send} FPS"
+            m_streamq = f"stream_q: {m_stream} frames"
+            m_saveq = f"save_q: {m_save} frames"
+            m_timeq = f"time_q: {m_time} timestamps"
+            m_exifq = f"exif_q: {m_exif} arrays"
             right_text = 'right camera'
-            r_capture = r_capt
-            r_encode = r_enc
-            r_sent = r_send
-            r_streamq = r_stream
-            r_saveq = r_save
-            r_timeq = r_time
-            r_exifq = r_exif
+            r_capture = f"capture: {r_capt} FPS"
+            r_encode = f"encode: {r_enc} FPS"
+            r_sent = f"send: {r_send} FPS"
+            r_streamq = f"stream_q: {r_stream} frames"
+            r_saveq = f"save_q: {r_save} frames"
+            r_timeq = f"time_q: {r_time} timestamps"
+            r_exifq = f"exif_q: {r_exif} arrays"
             text_color = (255,255,255)
             bg_color = (0,0,0)
             font = pygame.font.SysFont(None, 36)
