@@ -70,6 +70,9 @@ r_save = None
 r_time = None
 r_exif = None
 r_send = None
+l_rec = None
+m_rec = None
+r_rec = None
 CAMERA_CONFIGS = {
     "192.168.1.12": {"label": "left", "ssh_user": "ryan4"},
     "192.168.1.11": {"label": "mid",  "ssh_user": "ryan5"},
@@ -207,7 +210,7 @@ def init():
 
 
 def receiver(server_sock, label):
-    global latest_left, latest_mid, latest_right
+    global latest_left, latest_mid, latest_right, l_rec, m_rec, r_rec
     frame_count = 0
     last_time = time.time()
     while not stop_event.is_set():
@@ -237,9 +240,14 @@ def receiver(server_sock, label):
                 frame_count += 1
                 now = time.time()
                 elapsed = now-last_time
-                if elapsed >= 3:
-                    fps = frame_count/elapsed
-                    print(f"{label} camera recieving {fps} fps")
+                if elapsed >= 1:
+                    with stats_lock:
+                        if label == 'left':
+                            l_rec = frame_count/elapsed
+                        elif label == 'mid':
+                            m_rec = frame_count/elapsed
+                        else:
+                            r_rec = frame_count/elapsed
                     frame_count = 0
                     last_time = now
                 with frame_lock:
@@ -540,7 +548,7 @@ def main():
     save_thread.start()
     #disp_thread.start()
     gps_thread.start()
-    global latest_left, latest_mid, latest_right, l_capt, l_send, l_enc, l_stream, l_save, l_exif, l_time, m_capt, m_send, m_enc, m_stream, m_save, m_exif, m_time, r_capt, r_enc, r_send, r_stream, r_save, r_exif, r_time
+    global latest_left, latest_mid, latest_right, l_capt, l_send, l_enc, l_stream, l_save, l_exif, l_time, m_capt, m_send, m_enc, m_stream, m_save, m_exif, m_time, r_capt, r_enc, r_send, r_stream, r_save, r_exif, r_time, l_rec, m_rec, r_rec
     pygame.init()
     pygame.font.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -588,6 +596,7 @@ def main():
             l_capture = f"capture: {l_capt} FPS"
             l_encode = f"encode: {l_enc} FPS"
             l_sent = f"send: {l_send} FPS"
+            l_receive = f"receiced: {l_rec} FPS"
             l_streamq = f"stream_q: {l_stream} frames"
             l_saveq = f"save_q: {l_save} frames"
             l_timeq = f"time_q: {l_time} timestamps"
@@ -596,6 +605,7 @@ def main():
             m_capture = f"capture: {m_capt} FPS"
             m_encode = f"encode: {m_enc} FPS"
             m_sent = f"send: {m_send} FPS"
+            m_receive = f"received: {m_rec} FPS"
             m_streamq = f"stream_q: {m_stream} frames"
             m_saveq = f"save_q: {m_save} frames"
             m_timeq = f"time_q: {m_time} timestamps"
@@ -604,6 +614,7 @@ def main():
             r_capture = f"capture: {r_capt} FPS"
             r_encode = f"encode: {r_enc} FPS"
             r_sent = f"send: {r_send} FPS"
+            r_receive = f"received: {r_rec} FPS"
             r_streamq = f"stream_q: {r_stream} frames"
             r_saveq = f"save_q: {r_save} frames"
             r_timeq = f"time_q: {r_time} timestamps"
@@ -628,6 +639,7 @@ def main():
             lcs = font.render(l_capture, True, text_color)
             les = font.render(l_encode, True, text_color)
             lss = font.render(l_sent, True, text_color)
+            lrs = font.render(l_receive, True, text_color)
             lsts = font.render(l_streamq, True, text_color)
             lsas = font.render(l_saveq, True, text_color)
             lts = font.render(l_timeq, True, text_color)
@@ -636,6 +648,7 @@ def main():
             mcs = font.render(m_capture, True, text_color)
             mes = font.render(m_encode, True, text_color)
             mss = font.render(m_sent, True, text_color)
+            mrs = font.render(m_receive, True, text_color)
             msts = font.render(m_streamq, True, text_color)
             msas = font.render(m_saveq, True, text_color)
             mts = font.render(m_timeq, True, text_color)
@@ -644,6 +657,7 @@ def main():
             rcs = font.render(r_capture, True, text_color)
             res = font.render(r_encode, True, text_color)
             rss = font.render(r_sent, True, text_color)
+            rrs = font.render(r_receive, True, text_color)
             rsts = font.render(r_streamq, True, text_color)
             rsas = font.render(r_saveq, True, text_color)
             rts = font.render(r_timeq, True, text_color)
@@ -652,30 +666,34 @@ def main():
             lcr = lcs.get_rect(center=(360,600))
             ler = les.get_rect(center=(360,650))
             lsr = lss.get_rect(center=(360,700))
-            lstr = lsts.get_rect(center=(360,750))
-            lsar = lsas.get_rect(center=(360,800))
-            ltr = lts.get_rect(center=(360,850))
-            lexr = lexs.get_rect(center=(360,900))
+            lrr = lrs.get_rect(center=(360,750))
+            lstr = lsts.get_rect(center=(360,800))
+            lsar = lsas.get_rect(center=(360,850))
+            ltr = lts.get_rect(center=(360,900))
+            lexr = lexs.get_rect(center=(360,950))
             mid_rect = m_text_surface.get_rect(center = (1080, 552))
             mcr = mcs.get_rect(center=(1080,600))
             mer = mes.get_rect(center=(1080,650))
             msr = mss.get_rect(center=(1080,700))
-            mstr = msts.get_rect(center=(1080,750))
-            msar = msas.get_rect(center=(1080,800))
-            mtr = mts.get_rect(center=(1080,850))
-            mexr = mexs.get_rect(center=(1080,900))
+            mrr = mrs.get_rect(center=(1080,750))
+            mstr = msts.get_rect(center=(1080,800))
+            msar = msas.get_rect(center=(1080,850))
+            mtr = mts.get_rect(center=(1080,900))
+            mexr = mexs.get_rect(center=(1080,950))
             right_rect = r_text_surface.get_rect(center = (1800, 552))
             rcr = rcs.get_rect(center=(1800,600))
             rer = res.get_rect(center=(1800,650))
             rsr = rss.get_rect(center=(1800,700))
-            rstr = rsts.get_rect(center=(1800,750))
-            rsar = rsas.get_rect(center=(1800,800))
-            rtr = rts.get_rect(center=(1800,850))
-            rexr = rexs.get_rect(center=(1800,900))
+            rrr = rrs.get_rect(center=(1800,750))
+            rstr = rsts.get_rect(center=(1800,800))
+            rsar = rsas.get_rect(center=(1800,850))
+            rtr = rts.get_rect(center=(1800,900))
+            rexr = rexs.get_rect(center=(1800,950))
             screen.blit(l_text_surface, left_rect)
             screen.blit(lcs,lcr)
             screen.blit(les,ler)
             screen.blit(lss,lsr)
+            screen.blit(lrs, lrr)
             screen.blit(lsts, lstr)
             screen.blit(lsas,lsar)
             screen.blit(lts, ltr)
@@ -684,6 +702,7 @@ def main():
             screen.blit(mcs,mcr)
             screen.blit(mes,mer)
             screen.blit(mss,msr)
+            screen.blit(mrs, mrr)
             screen.blit(msts,mstr)
             screen.blit(msas,msar)
             screen.blit(mts,mtr)
@@ -692,6 +711,7 @@ def main():
             screen.blit(rcs,rcr)
             screen.blit(res,rer)
             screen.blit(rss,rsr)
+            screen.blit(rrs, rrr)
             screen.blit(rsts,rstr)
             screen.blit(rsas, rsar)
             screen.blit(rts,rtr)
