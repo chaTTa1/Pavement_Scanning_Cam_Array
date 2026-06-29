@@ -45,28 +45,95 @@ save_q = {
     "right": queue.Queue(500),
 }
 frame_lock = threading.Lock()
+stats_lock = threading.Lock()
 latest_left = None
 latest_mid = None
 latest_right = None
+m_capt = None
+m_enc = None
+m_stream = None
+m_save = None
+m_time = None
+m_exif = None
+m_send = None
+l_capt = None
+l_enc = None
+l_stream = None
+l_save = None
+l_time = None
+l_exif = None
+l_send = None
+r_capt = None
+r_enc = None
+r_stream = None
+r_save = None
+r_time = None
+r_exif = None
+r_send = None
 CAMERA_CONFIGS = {
     "192.168.1.12": {"label": "left", "ssh_user": "ryan4"},
     "192.168.1.11": {"label": "mid",  "ssh_user": "ryan5"},
     "192.168.1.13": {"label": "right","ssh_user": "ryan6"},
 }
 
-def stat_thread(STAT_PORT):
+def stat_thread(STAT_PORT, label):
+    global m_capt, m_save, m_send, m_enc, m_time, m_exif, m_stream, l_capt, l_enc, l_send, l_stream, l_save, l_exif, l_time, r_capt, r_enc, r_send, r_stream, r_time, r_exif, r_save
     stat_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     stat_server.bind((LISTEN_IP, STAT_PORT))
     stat_server.listen(5)
     conn, addr = stat_server.accecpt()
     print('connected:', addr)
+    buffer = ""
     while not stop_event.is_set():
         data = conn.recv(4096)
 
         if not data:
             break
+        buffer += data.decode()
 
-        print(data.decode(), end="")
+        while "\n" in buffer:
+            stats, buffer = buffer.split("\n", 1)
+
+            parts = [p.strip() for p in stats.split(",")]
+
+            if len(parts) != 8:
+                print(f"{label}: malformed stats: {stats}")
+                continue
+
+            fps_label = parts[0]
+            capture = str(parts[1].split("=")[1])
+            encode = str(parts[2].split("=")[1])
+            send = str(parts[3].split("=")[1])
+            save_q = str(parts[4].split("=")[1])
+            stream_q = str(parts[5].split("=")[1])
+            exif_q = str(parts[6].split("=")[1])
+            time_q = str(parts[7].split("=")[1])
+            with stats_lock:
+                if label =="mid":
+                    m_capt = capture
+                    m_enc = encode
+                    m_stream = stream_q
+                    m_save = save_q
+                    m_time = time_q
+                    m_exif = exif_q
+                    m_send = send
+                elif label =="left":
+                    l_capt = capture
+                    l_enc = encode
+                    l_stream = stream_q
+                    l_save = save_q
+                    l_time = time_q
+                    l_exif = exif_q
+                    l_send = send
+                else:
+                    r_capt = capture
+                    r_enc = encode
+                    r_stream = stream_q
+                    r_save = save_q
+                    r_time = time_q
+                    r_exif = exif_q
+                    r_send = send
+        #print(data.decode(), end="")
     
 def create_tcp_server(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -454,9 +521,9 @@ def main():
     save_thread = threading.Thread(target=saver, daemon = True)
     #disp_thread = threading.Thread(target = displayer, daemon = True)
     gps_thread = threading.Thread(target=gps_dummy_sender, daemon=True)
-    m_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT1), daemon=True)
-    l_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT2), daemon=True)
-    r_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT3), daemon=True)
+    m_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT1, "mid"), daemon=True)
+    l_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT2, "left"), daemon=True)
+    r_stats_thread = threading.Thread(target=stat_thread, args=(STAT_PORT3, "right"), daemon=True)
     l_rec_thread.start()
     m_rec_thread.start()
     r_rec_thread.start()
@@ -473,7 +540,7 @@ def main():
     save_thread.start()
     #disp_thread.start()
     gps_thread.start()
-    global latest_left, latest_mid, latest_right
+    global latest_left, latest_mid, latest_right, l_capt, l_send, l_enc, l_stream, l_save, l_exif, l_time, m_capt, m_send, m_enc, m_stream, m_save, m_exif, m_time, r_capt, r_enc, r_send, r_stream, r_save, r_exif, r_time
     pygame.init()
     pygame.font.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -518,8 +585,29 @@ def main():
                 pass
             
             left_text = 'left camera'
+            l_capture = l_capt
+            l_encode = l_enc
+            l_sent = l_send
+            l_streamq = l_stream
+            l_saveq = l_save
+            l_timeq = l_time
+            l_exifq = l_exif
             mid_text = 'mid camera'
+            m_capture = m_capt
+            m_encode = m_enc
+            m_sent = m_send
+            m_streamq = m_stream
+            m_saveq = m_save
+            m_timeq = m_time
+            m_exifq = m_exif
             right_text = 'right camera'
+            r_capture = r_capt
+            r_encode = r_enc
+            r_sent = r_send
+            r_streamq = r_stream
+            r_saveq = r_save
+            r_timeq = r_time
+            r_exifq = r_exif
             text_color = (255,255,255)
             bg_color = (0,0,0)
             font = pygame.font.SysFont(None, 36)
@@ -537,14 +625,77 @@ def main():
                 right_surface = pygame.surfarray.make_surface(np.swapaxes(right_img, 0, 1))
                 screen.blit(right_surface, (1280,0))
             l_text_surface = font.render(left_text, True, text_color)
+            lcs = font.render(l_capture, True, text_color)
+            les = font.render(l_encode, True, text_color)
+            lss = font.render(l_sent, True, text_color)
+            lsts = font.render(l_streamq, True, text_color)
+            lsas = font.render(l_saveq, True, text_color)
+            lts = font.render(l_timeq, True, text_color)
+            lexs = font.render(l_exifq, True, text_color)
             m_text_surface = font.render(mid_text, True, text_color)
+            mcs = font.render(m_capture, True, text_color)
+            mes = font.render(m_encode, True, text_color)
+            mss = font.render(m_sent, True, text_color)
+            msts = font.render(m_streamq, True, text_color)
+            msas = font.render(m_saveq, True, text_color)
+            mts = font.render(m_timeq, True, text_color)
+            mexs = font.render(m_exifq, True, text_color)
             r_text_surface = font.render(right_text, True, text_color)
+            rcs = font.render(r_capture, True, text_color)
+            res = font.render(r_encode, True, text_color)
+            rss = font.render(r_sent, True, text_color)
+            rsts = font.render(r_streamq, True, text_color)
+            rsas = font.render(r_saveq, True, text_color)
+            rts = font.render(r_timeq, True, text_color)
+            rexs = font.render(r_exifq, True, text_color)
             left_rect = l_text_surface.get_rect(center=(360,552))
+            lcr = lcs.get_rect(center=(360,600))
+            ler = les.get_rect(center=(360,650))
+            lsr = lss.get_rect(center=(360,700))
+            lstr = lsts.get_rect(center=(360,750))
+            lsar = lsas.get_rect(center=(360,800))
+            ltr = lts.get_rect(center=(360,850))
+            lexr = lexs.get_rect(center=(360,900))
             mid_rect = m_text_surface.get_rect(center = (1080, 552))
+            mcr = mcs.get_rect(center=(1080,600))
+            mer = mes.get_rect(center=(1080,650))
+            msr = mss.get_rect(center=(1080,700))
+            mstr = msts.get_rect(center=(1080,750))
+            msar = msas.get_rect(center=(1080,800))
+            mtr = mts.get_rect(center=(1080,850))
+            mexr = mexs.get_rect(center=(1080,900))
             right_rect = r_text_surface.get_rect(center = (1800, 552))
+            rcr = rcs.get_rect(center=(1800,600))
+            rer = res.get_rect(center=(1800,650))
+            rsr = rss.get_rect(center=(1800,700))
+            rstr = rsts.get_rect(center=(1800,750))
+            rsar = rsas.get_rect(center=(1800,800))
+            rtr = rts.get_rect(center=(1800,850))
+            rexr = rexs.get_rect(center=(1800,900))
             screen.blit(l_text_surface, left_rect)
+            screen.blit(lcs,lcr)
+            screen.blit(les,ler)
+            screen.blit(lss,lsr)
+            screen.blit(lsts, lstr)
+            screen.blit(lsas,lsar)
+            screen.blit(lts, ltr)
+            screen.blit(lexs,lexr)
             screen.blit(m_text_surface, mid_rect)
+            screen.blit(mcs,mcr)
+            screen.blit(mes,mer)
+            screen.blit(mss,msr)
+            screen.blit(msts,mstr)
+            screen.blit(msas,msar)
+            screen.blit(mts,mtr)
+            screen.blit(mexs,mexr)
             screen.blit(r_text_surface, right_rect)
+            screen.blit(rcs,rcr)
+            screen.blit(res,rer)
+            screen.blit(rss,rsr)
+            screen.blit(rsts,rstr)
+            screen.blit(rsas, rsar)
+            screen.blit(rts,rtr)
+            screen.blit(rexs,rexr)
             pygame.display.flip()
             clock.tick(30)
     except KeyboardInterrupt:
