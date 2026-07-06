@@ -38,17 +38,17 @@ import Jetson.GPIO as GPIO
 CAMERA_ID = "left"  # Change to "mid" or "right" for each camera
 
 PORT_MAP = {
-    "left": 5001,
-    "mid": 5002,
-    "right": 5000
+    "left": [5001, 6000],
+    "mid": [5002, 6001],
+    "right": [5000, 6002]
     }
 
 latest_gps = { "lat": None, "lon": None, "alt": None }
-SAVE_QUEUE_SIZE = 10000
-TIME_QUEUE_SIZE = 10000
-STREAM_QUEUE_SIZE = 1000
+SAVE_QUEUE_SIZE = 10
+TIME_QUEUE_SIZE = 10
+STREAM_QUEUE_SIZE = 10
 STREAM_EVERY_N = 1  # 200 FPS acquisition -> 20 FPS stream
-Exif_Queue_size = 1000
+Exif_Queue_size = 10
 save_q = queue.Queue(maxsize=SAVE_QUEUE_SIZE)
 stream_q = queue.Queue(maxsize=STREAM_QUEUE_SIZE)
 exif_q = queue.Queue(maxsize=Exif_Queue_size)
@@ -56,8 +56,12 @@ time_q = queue.Queue(maxsize=TIME_QUEUE_SIZE)
 
 # Event to signal threads to stop
 stop_event = threading.Event()
+
+# TARGET_IP must be configured on the host device
+# connect host to the local network then go into the network settings and set it to static IP and input 192.168.1.15
 TARGET_IP = '192.168.1.15'
-TARGET_PORT = PORT_MAP[CAMERA_ID]   # same port as before, now used for TCP image streaming
+PORTS = PORT_MAP[CAMERA_ID]
+TARGET_PORT = PORTS[0]   # same port as before, now used for TCP image streaming
 stop_event = threading.Event()
 event_time = 0.0
 frameRate = 435
@@ -67,15 +71,14 @@ stats_lock = threading.Lock()
 captured_frames = 0
 encoded_frames = 0
 sent_frames = 0
-LOG_HOST = "192.168.1.15"
-LOG_PORT = 6000
+LOG_PORT = PORTS[1]
 log_sock = None
 
 def connect_log_socket():
     global log_sock
     try:
         log_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        log_sock.connect((LOG_HOST, LOG_PORT))
+        log_sock.connect((TARGET_IP, LOG_PORT))
         print("[log] connected")
     except Exception as e:
         print(f"[log] connect failed: {e}")
