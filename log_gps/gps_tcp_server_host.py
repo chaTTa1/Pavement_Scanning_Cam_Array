@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 # User configuration
 # =========================
 
-XBEE_IP = "192.168.0.166"
+XBEE_IP = "10.83.203.186"
 SOCKET_PORT = 5000
 
 CSV_FILE_NAME = "gps_position_log.csv"
