@@ -106,6 +106,7 @@ SYNC = b"\x75\x65"
 
 DESC_BASE = 0x01
 DESC_3DM_CMD = 0x0C
+DESC_AIDING_CMD = 0x13
 DESC_SENSOR = 0x80
 DESC_GNSS_LEGACY = 0x81
 DESC_FILTER = 0x82
@@ -128,6 +129,8 @@ CMD_3DM_POLL_DATA = 0x0D
 CMD_3DM_PPS_SOURCE = 0x28
 CMD_3DM_GPIO_CONFIG = 0x41
 
+CMD_AIDING_FRAME_CONFIG = 0x01
+
 DESC_FILTER_CMD = 0x0D
 DESC_SYSTEM_CMD = 0x7F
 
@@ -145,6 +148,7 @@ ACK_OK = 0x00
 REPLY_3DM_BASE_RATE = 0x8E
 REPLY_3DM_PPS_SOURCE = 0xA8
 REPLY_3DM_GPIO_CONFIG = 0xC1
+REPLY_AIDING_FRAME_CONFIG = 0x81
 REPLY_FILTER_AIDING_MEASUREMENT_ENABLE = 0xD0
 REPLY_FILTER_INITIALIZATION_CONFIGURATION = 0xD2
 REPLY_SYSTEM_INTERFACE_CONTROL = 0x82
@@ -292,6 +296,11 @@ AIDING_SOURCE_NAMES = {
     6: "external_altimeter",
     7: "external_magnetometer",
     8: "body_frame_velocity",
+}
+
+AIDING_FRAME_FORMAT_NAMES = {
+    1: "euler",
+    2: "quaternion",
 }
 
 INTERFACE_NAMES = {
@@ -481,13 +490,16 @@ def decode_filter_field(field: MipField) -> Dict:
         data = {"q_w": qw, "q_x": qx, "q_y": qy, "q_z": qz, "valid_flags": flags}
     elif d == 0x05:
         roll, pitch, yaw, flags = unpack(">fffH", p, name)
+        yaw_deg = rad_to_deg(yaw)
         data = {
             "roll_rad": roll,
             "pitch_rad": pitch,
             "yaw_rad": yaw,
             "roll_deg": rad_to_deg(roll),
             "pitch_deg": rad_to_deg(pitch),
-            "yaw_deg": rad_to_deg(yaw),
+            "yaw_deg": yaw_deg,
+            "heading_deg": yaw_deg,
+            "heading_source": "ekf_attitude_euler_yaw",
             "valid_flags": flags,
         }
     elif d in (0x08, 0x09):
@@ -1555,6 +1567,85 @@ def read_gpio_config(ser: serial.Serial, reader: MipReader, pin: int, timeout_s:
     }
 
 
+def parse_aiding_frame_configuration(payload: bytes) -> Dict:
+    if len(payload) < 15:
+        raise MipError(f"aiding frame configuration response too short: {payload.hex()}")
+
+    frame_id, frame_format, tracking_enabled = unpack(">BBB", payload[:3], "aiding_frame_config")
+    translation = unpack(">fff", payload[3:15], "aiding_frame_config_translation")
+    data: Dict[str, object] = {
+        "frame_id": frame_id,
+        "format": frame_format,
+        "format_name": AIDING_FRAME_FORMAT_NAMES.get(frame_format, "unknown"),
+        "tracking_enabled": bool(tracking_enabled),
+        "translation_vehicle_frame_m": {
+            "x_forward": translation[0],
+            "y_right": translation[1],
+            "z_down": translation[2],
+        },
+    }
+
+    if frame_format == 1:
+        if len(payload) != 27:
+            raise MipError(
+                f"Euler aiding frame configuration response must be 27 bytes, got {len(payload)}: "
+                f"{payload.hex()}"
+            )
+        roll, pitch, yaw = unpack(">fff", payload[15:27], "aiding_frame_config_euler")
+        data["rotation_euler_rad"] = {"roll": roll, "pitch": pitch, "yaw": yaw}
+        data["rotation_euler_deg"] = {
+            "roll": rad_to_deg(roll),
+            "pitch": rad_to_deg(pitch),
+            "yaw": rad_to_deg(yaw),
+        }
+    elif frame_format == 2:
+        if len(payload) != 31:
+            raise MipError(
+                f"Quaternion aiding frame configuration response must be 31 bytes, got {len(payload)}: "
+                f"{payload.hex()}"
+            )
+        w, x, y, z = unpack(">ffff", payload[15:31], "aiding_frame_config_quaternion")
+        data["rotation_quaternion_wxyz"] = {"w": w, "x": x, "y": y, "z": z}
+    else:
+        raise MipError(f"unknown aiding frame format {frame_format}: {payload.hex()}")
+
+    data["payload_hex"] = payload.hex()
+    return data
+
+
+def read_aiding_frame_configuration(
+    ser: serial.Serial,
+    reader: MipReader,
+    frame_id: int,
+    frame_format: int,
+    timeout_s: float,
+) -> Dict:
+    if frame_id not in range(1, 5):
+        raise ValueError(f"aiding frame ID must be 1..4, got {frame_id}")
+    if frame_format not in AIDING_FRAME_FORMAT_NAMES:
+        raise ValueError(f"unsupported aiding frame format {frame_format}")
+
+    payload = command_response(
+        ser,
+        reader,
+        DESC_AIDING_CMD,
+        CMD_AIDING_FRAME_CONFIG,
+        bytes((MIP_FUNCTION_READ, frame_id, frame_format)),
+        REPLY_AIDING_FRAME_CONFIG,
+        timeout_s=timeout_s,
+    )
+    result = parse_aiding_frame_configuration(payload)
+    if result["frame_id"] != frame_id:
+        raise MipError(
+            f"aiding frame response ID {result['frame_id']} does not match requested ID {frame_id}"
+        )
+    if result["format"] != frame_format:
+        raise MipError(
+            f"aiding frame response format {result['format']} does not match requested format {frame_format}"
+        )
+    return result
+
+
 def read_interface_control(
     ser: serial.Serial,
     reader: MipReader,
@@ -1654,6 +1745,7 @@ def collect_stream_snapshot(reader: MipReader, duration_s: float, read_timeout_s
         "ekf_filter": [],
         "imu_sensor": [],
         "gnss": [],
+        "system": [],
         "other": [],
     }
     packet_counts: Dict[str, int] = {}
@@ -1680,6 +1772,8 @@ def collect_stream_snapshot(reader: MipReader, duration_s: float, read_timeout_s
                 sections["imu_sensor"].append(item)
             elif source == "GPS":
                 sections["gnss"].append(item)
+            elif source == "SYSTEM":
+                sections["system"].append(item)
             else:
                 sections["other"].append(item)
 
@@ -1770,6 +1864,16 @@ def run_status_snapshot(
         config = {
             "pps_source": safe_status_call(
                 "pps_source", lambda: read_pps_source(ser, reader, status_timeout_s)
+            ),
+            "aiding_frame_1": safe_status_call(
+                "aiding_frame_1",
+                lambda: read_aiding_frame_configuration(
+                    ser,
+                    reader,
+                    frame_id=1,
+                    frame_format=1,
+                    timeout_s=status_timeout_s,
+                ),
             ),
             "gpio": {
                 f"gpio{pin}": safe_status_call(
@@ -1902,6 +2006,20 @@ def run_status_snapshot(
                 )
             },
         )
+        latest_system_poll = safe_status_call(
+            "poll_time_sync_status",
+            lambda: {
+                "fields": collect_latest_by_field(
+                    poll_data_set(
+                        ser,
+                        reader,
+                        DESC_SYSTEM_DATA,
+                        [0x02],
+                        status_timeout_s,
+                    )
+                )
+            },
+        )
 
         stream_snapshot = collect_stream_snapshot(
             reader=reader,
@@ -1912,11 +2030,13 @@ def run_status_snapshot(
         latest_filter = prefer_valid_status(latest_filter_poll, stream_snapshot["ekf_filter"])
         latest_sensor = prefer_valid_status(latest_sensor_poll, stream_snapshot["imu_sensor"])
         latest_gnss = prefer_valid_status(latest_gnss_poll, stream_snapshot["gnss"])
+        latest_system = prefer_valid_status(latest_system_poll, stream_snapshot["system"])
 
         latest_poll_attempts = {
             "ekf_filter": latest_filter_poll,
             "imu_sensor": latest_sensor_poll,
             "gnss": latest_gnss_poll,
+            "system": latest_system_poll,
         }
 
         latest_stream = {
@@ -1924,10 +2044,11 @@ def run_status_snapshot(
             "ekf_filter": stream_snapshot["ekf_filter"],
             "imu_sensor": stream_snapshot["imu_sensor"],
             "gnss": stream_snapshot["gnss"],
+            "system": stream_snapshot["system"],
         }
 
         decoded_for_summary: List[Dict] = []
-        for section in (latest_filter, latest_sensor, latest_gnss):
+        for section in (latest_filter, latest_sensor, latest_gnss, latest_system):
             fields = section.get("fields")
             if isinstance(fields, dict):
                 decoded_for_summary.extend(fields.values())
@@ -1949,6 +2070,7 @@ def run_status_snapshot(
                 "ekf_filter": latest_filter,
                 "imu_sensor": latest_sensor,
                 "gnss": latest_gnss,
+                "system": latest_system,
                 "poll_attempts": latest_poll_attempts,
                 "stream_snapshot": latest_stream,
             },
@@ -2086,15 +2208,61 @@ def configure_streams(
         make_datastream_payload(DESC_FILTER, True),
     )
 
+    # Time synchronization is required to validate EXTERNAL_TIME aiding. Always
+    # request 0xA0,0x02 when configuring, even when verbose debug streams are off.
+    system_field_candidates = [[0x02, 0x01, 0x03], [0x02]] if debug else [[0x02]]
+    time_sync_stream_enabled = False
+    for system_fields in system_field_candidates:
+        try:
+            send_command(
+                ser,
+                reader,
+                DESC_3DM_CMD,
+                CMD_3DM_MESSAGE_FORMAT,
+                make_message_format_payload(DESC_SYSTEM_DATA, system_fields, system_decimation),
+                timeout_s=0.5,
+            )
+            send_command(
+                ser,
+                reader,
+                DESC_3DM_CMD,
+                CMD_3DM_DATASTREAM_CONTROL,
+                make_datastream_payload(DESC_SYSTEM_DATA, True),
+                timeout_s=0.5,
+            )
+            time_sync_stream_enabled = True
+            print(
+                json.dumps(
+                    {
+                        "event": "system_time_sync_stream_enabled",
+                        "fields": [f"0x{field:02X}" for field in system_fields],
+                        "rate_hz": system_rate_hz,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            break
+        except MipError:
+            pass
+    if not time_sync_stream_enabled:
+        print(
+            json.dumps(
+                {
+                    "event": "system_time_sync_stream_unavailable",
+                    "field": "0x02",
+                    "descriptor_set": "0xA0",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+
     if debug:
         sensor_field_candidates = [
             [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0A, 0x0C, 0x0E, 0x12, 0x14, 0x17, 0x18],
             [0x04, 0x05, 0x0E, 0x12, 0x18],
             [0x04, 0x05],
-        ]
-        system_field_candidates = [
-            [0x02, 0x01, 0x03],
-            [0x02],
         ]
         gnss_fields = [0x03, 0x05, 0x09, 0x0B, 0x0D]
         last_sensor_error: Optional[MipError] = None
@@ -2120,27 +2288,6 @@ def configure_streams(
             CMD_3DM_DATASTREAM_CONTROL,
             make_datastream_payload(DESC_SENSOR, True),
         )
-        for system_fields in system_field_candidates:
-            try:
-                send_command(
-                    ser,
-                    reader,
-                    DESC_3DM_CMD,
-                    CMD_3DM_MESSAGE_FORMAT,
-                    make_message_format_payload(DESC_SYSTEM_DATA, system_fields, system_decimation),
-                    timeout_s=0.5,
-                )
-                send_command(
-                    ser,
-                    reader,
-                    DESC_3DM_CMD,
-                    CMD_3DM_DATASTREAM_CONTROL,
-                    make_datastream_payload(DESC_SYSTEM_DATA, True),
-                    timeout_s=0.5,
-                )
-                break
-            except MipError:
-                pass
         # On 7-series products GNSS module streams are usually 0x91..0x95.
         # Some legacy tools use 0x81, so enable both forms if the device accepts them.
         for desc_set in (DESC_GNSS_LEGACY, 0x91):
@@ -2208,6 +2355,8 @@ def summarize_decoded_fields(decoded_items: List[Dict]) -> Optional[Dict]:
             summary["roll_deg"] = item.get("roll_deg")
             summary["pitch_deg"] = item.get("pitch_deg")
             summary["yaw_deg"] = item.get("yaw_deg")
+            summary["heading_deg"] = item.get("heading_deg")
+            summary["heading_source"] = item.get("heading_source")
             summary["attitude_valid"] = item.get("valid_flags")
             found = True
         elif field == "position_llh":
@@ -2276,6 +2425,8 @@ EKF_CSV_FIELDS = [
     "roll_deg",
     "pitch_deg",
     "yaw_deg",
+    "heading_deg",
+    "heading_source",
     "attitude_valid",
     "roll_uncert_deg",
     "pitch_uncert_deg",
@@ -2362,8 +2513,10 @@ GPS_CSV_FIELDS = [
     "ground_speed_kmph",
     "track_true_deg",
     "track_magnetic_deg",
+    "course_over_ground_deg",
     "heading_deg",
     "heading_true_deg",
+    "heading_source",
     "magnetic_variation_deg",
     "speed_accuracy_mps",
     "heading_accuracy_deg",
@@ -2776,6 +2929,7 @@ def parse_external_gga(row: Dict[str, object], fields: List[str]) -> None:
     hdop = parse_float_maybe(fields[7]) if len(fields) > 7 else None
     altitude = parse_float_maybe(fields[8]) if len(fields) > 8 else None
     geoid = parse_float_maybe(fields[10]) if len(fields) > 10 else None
+    ellipsoid_height = altitude + geoid if altitude is not None and geoid is not None else None
     dgps_age = parse_float_maybe(fields[12]) if len(fields) > 12 else None
     station = fields[13] if len(fields) > 13 else ""
 
@@ -2786,6 +2940,7 @@ def parse_external_gga(row: Dict[str, object], fields: List[str]) -> None:
             "valid_fix": int(fix_quality is not None and fix_quality > 0 and lat is not None and lon is not None),
             "latitude_deg": lat,
             "longitude_deg": lon,
+            "ellipsoid_height_m": ellipsoid_height,
             "altitude_m": altitude,
             "msl_height_m": altitude,
             "geoid_separation_m": geoid,
@@ -2827,7 +2982,7 @@ def parse_external_rmc(row: Dict[str, object], fields: List[str]) -> None:
             "ground_speed_mps": speed_knots * 0.514444 if speed_knots is not None else None,
             "speed_mps": speed_knots * 0.514444 if speed_knots is not None else None,
             "track_true_deg": track,
-            "heading_deg": track,
+            "course_over_ground_deg": track,
             "magnetic_variation_deg": mag_var,
             "rmc_status": status,
             "rmc_mode": mode,
@@ -2846,7 +3001,7 @@ def parse_external_vtg(row: Dict[str, object], fields: List[str]) -> None:
             "parsed_ok": 1,
             "track_true_deg": true_track,
             "track_magnetic_deg": mag_track,
-            "heading_deg": true_track,
+            "course_over_ground_deg": true_track,
             "ground_speed_knots": speed_knots,
             "ground_speed_mps": speed_knots * 0.514444 if speed_knots is not None else None,
             "speed_mps": speed_knots * 0.514444 if speed_knots is not None else None,
@@ -2877,7 +3032,14 @@ def parse_external_gst(row: Dict[str, object], fields: List[str]) -> None:
 
 def parse_external_hdt(row: Dict[str, object], fields: List[str]) -> None:
     heading = parse_float_maybe(fields[0]) if fields else None
-    row.update({"parsed_ok": 1, "heading_true_deg": heading, "heading_deg": heading})
+    row.update(
+        {
+            "parsed_ok": 1,
+            "heading_true_deg": heading,
+            "heading_deg": heading,
+            "heading_source": "nmea_hdt_true_heading",
+        }
+    )
 
 
 def parse_external_zda(row: Dict[str, object], fields: List[str]) -> None:
@@ -3425,8 +3587,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--init-heading-deg",
         type=float,
         help=(
-            "Temporarily set EKF initialization to automatic position/velocity/pitch/roll "
-            "with this user heading before reset/run."
+            "Write EKF initialization source=1 (user heading) and selector=0 before reset/run. "
+            "This replaces the recommended AUTO_POS_VEL_ATT/KINEMATIC configuration and therefore "
+            "requires --allow-user-heading-init-override."
+        ),
+    )
+    parser.add_argument(
+        "--allow-user-heading-init-override",
+        action="store_true",
+        help=(
+            "Explicitly acknowledge that --init-heading-deg writes 0x0D,0x52 and overrides "
+            "AUTO_POS_VEL_ATT/KINEMATIC. Do not use this while verifying the Barry configuration."
         ),
     )
     parser.add_argument("--debug", action="store_true", help="Print IMU sensor, GPS/GNSS, EKF, and unknown fields.")
@@ -3476,7 +3647,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--duration-s", type=float, default=0.0, help="Stop after this many seconds. 0 means forever.")
     parser.add_argument("--read-timeout-s", type=float, default=1.0, help="Serial read timeout.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.init_heading_deg is not None and not args.allow_user_heading_init_override:
+        parser.error(
+            "--init-heading-deg would overwrite 0x0D,0x52 AUTO_POS_VEL_ATT/KINEMATIC; "
+            "add --allow-user-heading-init-override only when that change is intentional"
+        )
+    if args.allow_user_heading_init_override and args.init_heading_deg is None:
+        parser.error("--allow-user-heading-init-override requires --init-heading-deg")
+    return args
 
 
 def running_in_spyder() -> bool:
@@ -3601,6 +3780,7 @@ def run_cv7_status(
     init_heading_deg: Optional[float] = None,
     reset_filter: bool = False,
     run_filter: bool = False,
+    allow_user_heading_init_override: bool = False,
 ) -> int:
     """Convenience function for Spyder Console to pull one IMU status snapshot."""
     argv: List[str] = [
@@ -3616,8 +3796,14 @@ def run_cv7_status(
         argv.extend(["--port", port])
     if pretty_json:
         argv.append("--pretty")
+    if init_heading_deg is not None and not allow_user_heading_init_override:
+        raise ValueError(
+            "init_heading_deg overrides AUTO_POS_VEL_ATT/KINEMATIC; set "
+            "allow_user_heading_init_override=True only when intentional"
+        )
     if init_heading_deg is not None:
         argv.extend(["--init-heading-deg", str(init_heading_deg)])
+        argv.append("--allow-user-heading-init-override")
     if reset_filter:
         argv.append("--reset-filter")
     if run_filter:
@@ -3680,6 +3866,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "configure": args.configure,
                 "stream_preset": args.stream_preset,
                 "init_heading_deg": args.init_heading_deg,
+                "user_heading_init_override_allowed": args.allow_user_heading_init_override,
                 "reset_filter": args.reset_filter,
                 "run_filter": args.run_filter,
                 "summary": args.summary,
