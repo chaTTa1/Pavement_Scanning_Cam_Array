@@ -1083,6 +1083,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--gui-executable",
         help="path to cv7_pangolin_viewer executable",
     )
+    init_heading_group = parser.add_mutually_exclusive_group()
+    init_heading_group.add_argument(
+        "--init-heading-deg",
+        type=float,
+        default=None,
+        help=(
+            "send MIP Set Initial Heading (0x0D, 0x03) once, in degrees. "
+            "Equivalent to clicking Apply Initial Values with only Heading/Yaw "
+            "in SensorConnect. Only valid while the filter is in the "
+            "Initialization state."
+        ),
+    )
+    init_heading_group.add_argument(
+        "--init-heading-rad",
+        type=float,
+        default=None,
+        help="same as --init-heading-deg but the value is already in radians",
+    )
+    parser.add_argument(
+        "--init-heading-ignore-errors",
+        action="store_true",
+        help=(
+            "do not abort if Set Initial Heading fails (e.g. filter already past "
+            "the Initialization state, or MSCL command timeout under heavy data load)"
+        ),
+    )
+    parser.add_argument(
+        "--init-heading-timeout-ms",
+        type=int,
+        default=3000,
+        help=(
+            "MSCL command response timeout in ms while sending Set Initial Heading. "
+            "Defaults to 3000 because the CV7 is streaming data at up to 500 Hz on the "
+            "same serial link and the stock MSCL timeout can be too short."
+        ),
+    )
+    parser.add_argument(
+        "--init-heading-retries",
+        type=int,
+        default=3,
+        help="number of Set Initial Heading attempts before giving up",
+    )
     return parser
 
 
@@ -1181,7 +1223,93 @@ def run(args: argparse.Namespace) -> Path:
     print(f"Opening CV7 data stream: {cv7_port} @ {args.cv7_baud}")
     connection = mscl.Connection.Serial(cv7_port, args.cv7_baud)
     node = mscl.InertialNode(connection)
-    print("Read-only mode: no CV7 or GPS configuration/stream-control calls will be made.")
+
+    # ---- Optional one-shot: MIP Set Initial Heading (0x0D, 0x03) ----
+    # Mirrors SensorConnect's "Apply Initial Values" (Heading/Yaw only) button.
+    # This is the sole exception to the read-only guarantee, and only fires when
+    # the user explicitly passes --init-heading-deg or --init-heading-rad.
+    init_heading_rad: Optional[float] = None
+    if args.init_heading_rad is not None:
+        init_heading_rad = float(args.init_heading_rad)
+        init_heading_src = "--init-heading-rad"
+    elif args.init_heading_deg is not None:
+        init_heading_rad = math.radians(float(args.init_heading_deg))
+        init_heading_src = "--init-heading-deg"
+
+    if init_heading_rad is not None:
+        # Wrap to (-pi, pi] so out-of-range user input (e.g. 370 deg) is sane.
+        wrapped = math.atan2(math.sin(init_heading_rad), math.cos(init_heading_rad))
+        print(
+            "Read-only mode with ONE exception: sending MIP Set Initial Heading "
+            f"(0x0D, 0x03) = {wrapped:.6f} rad (from {init_heading_src}). "
+            "No other configuration, stream, or save-settings commands will be issued."
+        )
+        # Raise MSCL command timeout: the CV7 is already streaming 0x80/0x82 on the
+        # same serial link, and the stock ~500 ms timeout can miss the ACK when the
+        # response parser is competing with a flood of data packets. This is the
+        # most common cause of Error_Communication here (not an actual NACK).
+        prior_timeout_ms: Optional[int] = None
+        try:
+            prior_timeout_ms = int(node.commandsTimeout())
+        except Exception:
+            prior_timeout_ms = None
+        try:
+            node.commandsTimeout(int(max(500, args.init_heading_timeout_ms)))
+        except Exception as timeout_exc:
+            print(f"  warning: could not raise MSCL command timeout: {timeout_exc}")
+
+        last_exc: Optional[BaseException] = None
+        sent_ok = False
+        attempts = max(1, int(args.init_heading_retries))
+        for attempt in range(1, attempts + 1):
+            try:
+                node.setInitialHeading(float(wrapped))
+                sent_ok = True
+                print(f"  Set Initial Heading acknowledged (attempt {attempt}/{attempts}).")
+                break
+            except Exception as heading_exc:
+                last_exc = heading_exc
+                err_txt = str(heading_exc)
+                # Error_Communication == timeout / no response parsed. Retrying often
+                # succeeds because the ACK just got buried behind streaming data.
+                is_comm = "Error_Communication" in err_txt or "Communication" in err_txt
+                print(
+                    f"  Set Initial Heading attempt {attempt}/{attempts} failed"
+                    f" ({'timeout' if is_comm else 'error'}): {heading_exc}"
+                )
+                if attempt < attempts:
+                    time.sleep(0.25)
+
+        # Restore prior timeout regardless of outcome.
+        if prior_timeout_ms is not None:
+            try:
+                node.commandsTimeout(prior_timeout_ms)
+            except Exception:
+                pass
+
+        if not sent_ok:
+            msg = (
+                "Set Initial Heading failed after retries: "
+                f"{last_exc}. Common causes: (1) the filter has already left the "
+                "Initialization state (SensorConnect shows the same behavior; "
+                "power-cycle the CV7 or reset the filter to re-apply), or "
+                "(2) MSCL command timeout under heavy streaming load "
+                "(try --init-heading-timeout-ms 5000 or --init-heading-retries 5). "
+                "Pass --init-heading-ignore-errors to continue recording anyway."
+            )
+            if args.init_heading_ignore_errors:
+                print(msg)
+                print("  --init-heading-ignore-errors set; continuing.")
+            else:
+                try:
+                    connection.disconnect()
+                except Exception:
+                    pass
+                raise SystemExit(msg)
+    else:
+        print("Read-only mode: no CV7 or GPS configuration/stream-control calls will be made.")
+    # ---- end Set Initial Heading block ----
+
     if gps_port:
         print(f"Opening GPS NMEA stream: {gps_port} @ {args.gps_baud}")
     else:
