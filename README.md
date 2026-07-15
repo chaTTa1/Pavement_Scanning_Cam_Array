@@ -362,3 +362,251 @@ $$f = \max\left(FPS_{min}, \min(f_{raw}, FPS_{max})\right)$$
 ### 5. Final Dynamic Delay ($t_{delay}$)
 Finally, the framerate is inverted to determine the required `time.sleep()` duration (in seconds) between each frame capture:
 $$t_{delay} = \frac{1}{f}$$
+
+## NMEA only
+
+本节记录 2026-07-14 完成的 mosaic-H 双天线 GPS 与 MicroStrain
+3DM-CV7-INS 直连方案、SensorConnect 设置、只读采集程序和已解决的问题。
+
+### “NMEA only”的范围
+
+这里的 “NMEA only” 是指 **mosaic-H 到 CV7 的外部 aiding 链路使用 NMEA**，不经过
+Teensy。它不表示电脑端只能读取 NMEA：
+
+```text
+mosaic-H COM1 TX  ── NMEA ──>  CV7 RX
+mosaic-H USB2     ── NMEA ──>  Windows COM16（电脑保存 GPS raw）
+CV7 MAIN USB      ── MIP  ──>  Windows COM13（电脑保存 IMU raw 和 EKF）
+```
+
+- GPS TX 和 CV7 RX 必须共地，串口波特率当前为 `115200`。
+- CV7 的电脑输出继续使用 MIP；不要为了这套接线关闭 MAIN 接口的 MIP。
+- 在 SensorConnect 的 Interface Control 中，只在**实际连接 GPS TX 的 CV7 物理接口**勾选
+  `Incoming NMEA`。
+- `Outgoing NMEA` 对电脑读取 CV7 MIP 没有必要；只有确实需要 CV7 转发 NMEA 时才启用。
+- COM 号可能在重新插拔后改变，以上是本次验证时的端口身份。
+
+本次 Windows 11 测试观察到的端口角色：
+
+| Port | Observed role |
+| --- | --- |
+| `COM13` | CV7 MAIN MIP stream，能检测到 descriptor sets `0x80/0x82` |
+| `COM8` | 同一 MicroStrain 设备的另一个 USB serial interface，当时没有可读 MIP packet |
+| `COM15` | Septentrio Virtual USB COM Port 1，通常用于命令/控制 |
+| `COM16` | Septentrio Virtual USB COM Port 2，输出 USB2 raw NMEA |
+
+同一个 Windows COM port 通常不能被两个程序同时打开。如果 SensorConnect、RxTools 或
+另一个 Python process 正在占用端口，自动检测会出现 `PermissionError(13, 'Access is denied')`；
+关闭占用该端口的软件后再运行记录器。
+
+### 双天线 heading 方向
+
+- mosaic-H 的 `ANT_1` 是 main antenna，`ANT_2` 是 auxiliary antenna。
+- heading 基线方向是 **main antenna 指向 auxiliary antenna**，不是副天线指向主天线；
+  方位角以真北为 `0°`，顺时针增加。
+- 如果希望 HDT 直接代表车辆前进方向，通常把 main antenna 放在后面、auxiliary antenna
+  放在前面；如果实际安装方向不同，需要在 mosaic-H 中配置正确的 heading offset。
+- 室内没有足够卫星信号或双天线解算无效时，HDT 可以为空。mosaic-H 双天线 heading
+  在室外有效解算时不依赖车辆运动；CV7 的 kinematic heading 初始化则需要运动。
+
+Septentrio 官方硬件手册确认 `ANT_1`/`ANT_2` 分别对应 main/auxiliary antenna：
+[mosaic Hardware Manual](https://www.septentrio.com/system/files/support/mosaic_hardware_manual_v1.11.0.pdf)。
+
+### mosaic-H NMEA 查询与当前输出
+
+只读查看 USB2 数据协议和全部 NMEA stream：
+
+```text
+getDataInOut,USB2
+getNMEAOutput,all
+```
+
+本次确认过的主要输出为：
+
+```text
+NMEAOutput, Stream1, COM2, GGA, msec100
+NMEAOutput, Stream2, USB2, GGA+GST+HDT+RMC, msec100
+NMEAOutput, Stream3, COM1, GGA+GSV+HDT+RMC+VTG+ZDA, msec100
+```
+
+- `Stream2/USB2` 给电脑记录 GPS raw，每种消息周期为 `100 ms`。
+- `Stream3/COM1` 通过 GPS TX 送入 CV7 RX。
+- `NMEAOutput,...` 是查询结果，不能直接作为设置命令重新发送；修改时必须使用
+  `setNMEAOutput`，例如：
+
+```text
+setNMEAOutput,Stream2,USB2,GGA+GST+HDT+RMC,msec100
+```
+
+每次修改后用 `getNMEAOutput,all` 复核。更完整的 Septentrio/XBee 命令说明见
+[XBee_mosaicH_RTK_setup_guide_EN.md](log_gps/XBee_mosaicH_RTK_setup_guide_EN.md)。
+
+### CV7 初始化与 aiding 设置
+
+MicroStrain 支持建议先在 SensorConnect 中加载 factory defaults，然后将默认 IMU-AHRS
+设置保存为 startup settings。当前阶段不要修改 factory-default IMU-AHRS 参数。
+
+外置 GNSS 天线中心与 CV7 物理原点不重合，因此以下两项是正确位置解算所必需的：
+
+1. 配置 Aiding Frame Configuration（MIP `0x13,0x01`）。
+2. 按所选 frame 测量并输入 GNSS antenna lever arm；方向、坐标轴和正负号必须依据
+   MicroStrain 手册及实际安装尺寸，不能用估计值替代。
+
+MicroStrain 推荐的 Navigation Filter Initialization（MIP `0x0D,0x52`）为：
+
+| Parameter | Value |
+| --- | --- |
+| Wait For Run Command | `0` |
+| Initial Condition Source | `0` (`AUTO_POS_VEL_ATT`) |
+| Auto Heading Alignment Selector | `1` (`kinematic`) |
+| Reference Frame Selector | `2` (`LLH`) |
+| Initial position/velocity/attitude values | 忽略 |
+
+相关官方页面：
+
+- [Antenna offsets](https://s3.amazonaws.com/files.microstrain.com/CV7_INS_Manual/user_manual_content/installation/Antenna.htm)
+- [Frame Configuration 0x13,0x01](https://s3.amazonaws.com/files.microstrain.com/CV7_INS_Manual/external_content/dcp/Commands/0x13/data/0x01.htm)
+- [Navigation Filter Initialization 0x0D,0x52](https://s3.amazonaws.com/files.microstrain.com/CV7_INS_Manual/external_content/dcp/Commands/0x0d/data/0x52.htm)
+
+### `Enabled`、`Used` 与 heading 初始化
+
+配置查询中的 `aiding_enable` 只表示某类 measurement **允许进入滤波器**，不表示当前
+已经收到并采用该 measurement。SensorConnect 的 Aiding Measurements 面板以及 CV7
+Filter Status 才表示运行时状态：
+
+- `Enabled`：该 runtime aiding measurement 当前有效并已被滤波器接受。
+- `Used`：该 measurement 正在参与当前 EKF 更新。
+- 正确运行时，GNSS Position 和 GNSS Velocity 应显示 `Enabled + Used`；有效 HDT/heading
+  输入存在时，Heading 也应显示相应状态。
+
+曾读取到的配置包括：
+
+```text
+gnss_position_velocity: enabled=true
+external_heading: enabled=true
+gnss_heading: command 0x0D,0x50 NACK 0x03
+```
+
+这不能证明 GNSS 当时已经被 EKF 使用。`gnss_heading` 查询 NACK 也不等同于 HDT 一定
+无效；需要结合设备固件支持、实际 NMEA 输入和 Filter Status 判断。SensorConnect 中
+全部灰色时，应理解为当前 runtime measurement 没有达到 Enabled/Used，而不是与配置
+JSON 矛盾。
+
+如果采用 `AUTO_POS_VEL_ATT + kinematic` 初始化而没有有效双天线 HDT，车辆需要在室外
+进行足够的直线运动，使 CV7 从速度方向建立 heading。室内可在 SensorConnect 中设置
+manual heading 进行链路测试，并能让设备进入 Full Navigation，但这个假 heading 不能
+用于验证真实 GNSS heading，也不应保存为正式道路采集配置。
+
+### Python 3.12 / Anaconda 环境
+
+在激活的 `py312` Conda 环境中安装：
+
+```powershell
+python -m pip install python-mscl pyserial matplotlib
+```
+
+`python -m pip` 表示让当前 `python` 解释器运行 pip module，可以避免把包安装到另一个
+Python 环境。本次验证使用：
+
+```text
+Python 3.12
+python-mscl 67.1.0.0
+```
+
+不要安装无关的同名 `mscl` 包。程序会检查 module 是否真正提供 MicroStrain 的
+`Connection` 和 `InertialNode`；`python-mscl` 的正确导入路径为
+`from python_mscl import mscl`。
+
+### 只读 CSV 采集程序
+
+主程序为 [CV7_read_nmea.py](IMU_EKF/CV7_read_nmea.py)，详细说明见
+[CV7_read_nmea.md](IMU_EKF/CV7_read_nmea.md)。程序参考 MicroStrain 官方 MSCL 接收流程：
+
+```text
+Connection.Serial -> InertialNode -> getDataPackets
+```
+
+程序不会调用 `setToIdle()`、`resume()`、`setActiveChannelFields()`、
+`enableDataStream()`、`saveSettings()`，也不会向 mosaic-H 发送配置命令。
+
+查看端口：
+
+```powershell
+python IMU_EKF\CV7_read_nmea.py --list-ports
+```
+
+自动识别端口并开始记录：
+
+```powershell
+python IMU_EKF\CV7_read_nmea.py
+```
+
+明确指定本次验证的端口：
+
+```powershell
+python IMU_EKF\CV7_read_nmea.py --cv7-port COM13 --gps-port COM16
+```
+
+只保存图片、不打开 plot 窗口：
+
+```powershell
+python IMU_EKF\CV7_read_nmea.py --no-show-plot
+```
+
+完全关闭绘图：
+
+```powershell
+python IMU_EKF\CV7_read_nmea.py --no-plot
+```
+
+启动实时 Pangolin/OpenGL 状态和轨迹窗口：
+
+```powershell
+python IMU_EKF\CV7_read_nmea.py --gui
+```
+
+GUI 状态直接显示 `Full Navigation`、`Stable`、`Enabled and Used`、
+`RTK Fixed` 等文字，不使用枚举数字代替。蓝色为 EKF 轨迹，橙色为 raw GPS
+GGA 点。Viewer 的 Windows 与 Jetson 构建方法见
+[pangolin_viewer/README.md](IMU_EKF/pangolin_viewer/README.md)。GUI 是低频 UDP
+旁路，不改变 CV7/GPS 配置，也不影响 CSV 的原生速率采集。
+
+CSV 每一行保存一个原生速率 event，使用 `source` 区分：
+
+| Source | Content |
+| --- | --- |
+| `CV7_IMU` | CV7 `0x80` 原始 IMU/AHRS fields |
+| `CV7_EKF` | CV7 `0x82` filter/EKF fields |
+| `CV7_GNSS` | CV7 当前输出的 `0x81` GNSS fields（如果存在） |
+| `CV7_OTHER` | 其他 MIP descriptor sets |
+| `GPS_NMEA` | mosaic-H USB2 原始和解析后的 NMEA |
+
+记录结束后会生成 raw GPS 与 EKF position 对比图：蓝色为 CV7 EKF，橙色为 GPS raw
+GGA。GPS raw 不会被重复填充到每一条 500 Hz IMU 行。
+
+### 已解决的数据问题
+
+1. **EKF 经纬度为 0**：通常表示 filter 尚未得到有效 position 或未完成初始化；heading
+   缺失可能阻止 Full Navigation，但不能只凭 `0,0` 判断唯一原因。应同时查看 Filter
+   State、GNSS Position/Velocity 的 Enabled/Used 和 heading 状态。
+2. **GPS 与 EKF 初始点不同**：可能同时包含天线 lever arm、两个位置参考点不同、EKF
+   平滑/延迟、启动旧 NMEA、以及原程序把 double 降为 float32 等因素。应先完成 frame
+   和 lever arm，再比较同步后的点。
+3. **GPS NMEA 丢行**：旧版线程会被约 500 Hz 的 MSCL/CSV 工作阻塞。现在 GPS 使用独立
+   process，并批量读取 Windows 串口 buffer；稳定记录到 GGA/GST/HDT/RMC 各 `10 Hz`。
+4. **USB 启动旧数据**：Septentrio 虚拟 COM 端口可能保留有限的旧数据。程序会高速追赶，
+   并在 NMEA UTC 接近电脑 UTC 后才写入本次 CSV；没有 UTC 字段时 3 秒后回退开始记录。
+5. **MSCL 精度损失**：旧版对所有 field 调用 `as_float()`，使 `estLatitude` 和
+   `estLongitude` 从 double 降为 float32。现在按 `storedAs()` 调用 `as_double()`、
+   `as_uint64()` 等正确接口。
+6. **Ctrl+C 子进程 traceback**：Windows 会把控制台中断发给所有 process。现在 GPS
+   process 忽略 `SIGINT`，由主进程设置共享停止事件并统一关闭 CSV/串口。
+
+最后一次硬件只读验证结果：
+
+- GGA/GST/HDT/RMC 均约 `10 Hz`，GGA interval median 为 `0.09990 s`。
+- 追到实时后，GPS fix time 与电脑接收时间差稳定约 `-74` 至 `-77 ms`，没有先前约
+  `431 s` 的启动旧数据跳跃。
+- 3,088 条含 position 的 EKF 记录得到 3,088 个不同经纬度值，double 精度已保留。
+- `uint64` reference time 以完整整数写入 CSV。
+- `Ctrl+C` 实测可正常输出 `Stopped`、保存 CSV，且不再出现子进程 traceback。

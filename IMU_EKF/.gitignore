@@ -1,0 +1,37 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime recordings and device-specific snapshots
+data/
+*.csv
+3DM-CV7-INS_*.bin
+3DM-CV7-INS_*.json
+cv7_status.json
+
+# Generated analysis and plot output
+csv_compare_plots_*/
+factor_graph_output_*/
+offline_ekf_plots_*/
+*_gps_vs_ekf.png
+
+# Pangolin/CMake build products
+pangolin_viewer/build/
+pangolin_viewer/build-*/
+*.exe
+*.dll
+*.lib
+*.pdb
+
+# Checked-in Windows release package (explicit exception to the rules above)
+!pangolin_viewer/release/
+!pangolin_viewer/release/windows-x64/
+!pangolin_viewer/release/windows-x64/cv7_pangolin_viewer.exe
+!pangolin_viewer/release/windows-x64/glew32.dll
+!pangolin_viewer/release/windows-x64/README.txt
+
+# OS/editor files
+.DS_Store
+Thumbs.db
