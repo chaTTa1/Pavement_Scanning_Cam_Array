@@ -207,8 +207,8 @@ def plot_polygon_facet(points_2d, polygon_2d):
 
 
 def main():
-    input_ply = r"D:\Ryan\GitHub\paper\road_defect_detection\images\reconstruction_global\scene_dense.ply"
-    output_ply = r"D:\Ryan\GitHub\paper\road_defect_detection\images\reconstruction_global\point_cloud_with_facet_distances.ply"
+    input_ply = r"D:\Ryan\GitHub\Pavement_Scanning_Cam_Array\pavement_analysis\scan\reconstruction_sequential\scene_dense.ply"
+    output_ply = r"D:\Ryan\GitHub\Pavement_Scanning_Cam_Array\pavement_analysis\scan\reconstruction_sequential\point_cloud_with_facet_distances.ply"
 
     points, rgb = read_ply_points(input_ply)
 
