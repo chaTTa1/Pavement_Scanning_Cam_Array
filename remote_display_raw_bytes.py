@@ -267,7 +267,7 @@ def init():
     for host, config in CAMERA_CONFIGS.items():
         remote_cmd = (
             f"cd /home/{config['ssh_user']}/Alex/Blackfly && "
-            f"nohup python3 blkfly_md435.py > /tmp/{config['label']}_blkfly_md435.log 2>&1 &"
+            f"nohup python3 blkfly_rawbytes.py > /tmp/{config['label']}_blkfly_rawbytes.log 2>&1 &"
         )
         try:
             subprocess.Popen(["ssh", f"{config['ssh_user']}@{host}", remote_cmd])
@@ -493,7 +493,7 @@ def de_init():
     for host, config in CAMERA_CONFIGS.items():
         try:
             result = subprocess.run(
-                ["ssh", f"{config['ssh_user']}@{host}", "pgrep -f blkfly_md435.py"],
+                ["ssh", f"{config['ssh_user']}@{host}", "pgrep -f blkfly_rawbytes.py"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -813,23 +813,23 @@ def main():
         R_capt = [float(x) for x in R_capt]
         R_send = [float(x) for x in R_send]
         fig, ax = plt.subplots(3, 1, sharex=True)
-        ax[0].plot(range(len(L_tot_fps)), L_tot_fps)
-        ax[0].plot(range(len(L_capt)-7), L_capt[7:])
-        ax[0].plot(range(len(L_send)-7), L_send[7:])
+        ax[0].plot(range(len(L_tot_fps)), L_tot_fps, linestyle='-', alpha=.5)
+        ax[0].plot(range(len(L_capt)-7), L_capt[7:], linestyle=':', alpha=1)
+        ax[0].plot(range(len(L_send)-7), L_send[7:], linestyle='--', alpha=.5)
         ax[0].legend(['recieved', 'captured', 'sent'])
         ax[0].set_xlabel('time [s]')
         ax[0].set_ylabel('frames per second')
         ax[0].set_title('left camera frame rate vs. time')
-        ax[1].plot(range(len(R_tot_fps)), R_tot_fps)
-        ax[1].plot(range(len(R_capt)-7), R_capt[7:])
-        ax[1].plot(range(len(R_send)-7), R_send[7:])
+        ax[1].plot(range(len(R_tot_fps)), R_tot_fps, linestyle='-', alpha=.5)
+        ax[1].plot(range(len(R_capt)-7), R_capt[7:], linestyle=':', alpha=1)
+        ax[1].plot(range(len(R_send)-7), R_send[7:], linestyle='--', alpha=.5)
         ax[1].legend(['recieved', 'captured', 'sent'])
         ax[1].set_xlabel('time [s]')
         ax[1].set_ylabel('frames per second')
         ax[1].set_title('right camera frame rate vs. time')
-        ax[2].plot(range(len(M_tot_fps)), M_tot_fps)
-        ax[2].plot(range(len(M_capt)-6), M_capt[6:])
-        ax[2].plot(range(len(M_send)-6), M_send[6:])
+        ax[2].plot(range(len(M_tot_fps)), M_tot_fps, linestyle='-', alpha=.5)
+        ax[2].plot(range(len(M_capt)-6), M_capt[6:], linestyle=':', alpha=1)
+        ax[2].plot(range(len(M_send)-6), M_send[6:], linestyle='--', alpha=.5)
         ax[2].legend(['recieved', 'captured', 'sent'])
         ax[2].set_xlabel('time [s]')
         ax[2].set_ylabel('frames per second')
