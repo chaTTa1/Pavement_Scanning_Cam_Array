@@ -1126,6 +1126,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="number of Set Initial Heading attempts before giving up",
     )
+    parser.add_argument(
+        "--pps-pin",
+        type=int,
+        default=7,
+        help="BOARD-mode header pin the shared PPS is wired to on the AGX (default 7).",
+    )
+    parser.add_argument(
+        "--no-pps",
+        action="store_true",
+        help=(
+            "do not latch PPS on GPIO; use the shared pulse-epoch file written by "
+            "remote_display (recovered from the nanos' image EXIF) instead."
+        ),
+    )
+    parser.add_argument(
+        "--pps-timeout",
+        type=float,
+        default=None,
+        help=(
+            "seconds to wait for the pulse before falling back to the epoch file. "
+            "Default: wait forever (matches the nanos)."
+        ),
+    )
     return parser
 
 
@@ -1209,6 +1232,56 @@ def time_from_pulse():
     return round(get_tow_from_utc() - et, 4)
 
 
+# ---------------------------------------------------------------------------
+# AGX joins the SAME pulse barrier the nanos use.
+# ---------------------------------------------------------------------------
+# The shared PPS line (from the Teensy clock buffer) is wired to a header pin on
+# the AGX Orin, same as the nanos (BOARD-mode pin 7). We arm the pin and BLOCK,
+# exactly like the nanos, so with the pulse amplifier powered OFF every machine
+# sits waiting. Powering the amplifier ON delivers the first rising edge to all
+# machines at once -> everyone unblocks on the SAME pulse and stamps event_time
+# with the identical get_tow_from_utc() the nanos use. No inter-machine messages
+# are needed; the power switch IS the barrier.
+#
+# If Jetson.GPIO is unavailable, --no-pps is passed, or no edge arrives before
+# --pps-timeout, we fall back to the shared pulse-epoch file that
+# remote_display writes (recovered from the nanos' image EXIF).
+try:
+    import Jetson.GPIO as GPIO  # type: ignore
+except Exception:
+    GPIO = None
+
+
+def arm_and_wait_for_pulse(pin, timeout_s=None):
+    """Block until the shared PPS edge arrives on BOARD `pin`, then latch
+    _pulse_event_time. Returns True if latched via GPIO, else False (caller
+    falls back to the shared pulse-epoch file)."""
+    global _pulse_event_time
+    if GPIO is None:
+        print("[pulse-epoch] Jetson.GPIO not available; will use shared epoch "
+              f"file {PULSE_EPOCH_FILE} (written by remote_display).", flush=True)
+        return False
+    try:
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(pin, GPIO.IN)
+        print(f"[pulse-epoch] AGX armed on BOARD pin {pin}; waiting for pulse "
+              "-- power on the amplifier now...", flush=True)
+        ms = None if timeout_s is None else int(timeout_s * 1000)
+        edge = GPIO.wait_for_edge(pin, GPIO.RISING, timeout=ms)
+        if edge is None:
+            print(f"[pulse-epoch] WARNING: no pulse on pin {pin} within "
+                  f"{timeout_s}s; falling back to {PULSE_EPOCH_FILE}.", flush=True)
+            return False
+        _pulse_event_time = get_tow_from_utc()
+        print(f"[pulse-epoch] AGX latched pulse: event_time={_pulse_event_time} "
+              "(same origin as the nanos)", flush=True)
+        return True
+    except Exception as exc:
+        print(f"[pulse-epoch] GPIO arm failed ({exc}); falling back to "
+              f"{PULSE_EPOCH_FILE}.", flush=True)
+        return False
+
+
 def finalize_event(
     event: Dict[str, Any], mip_columns: Dict[str, str], record_index: int
 ) -> Dict[str, Any]:
@@ -1236,6 +1309,13 @@ def run(args: argparse.Namespace) -> Path:
     require_dependencies(serial_required=(cv7_auto or gps_enabled))
     if args.duration < 0 or args.schema_seconds < 0:
         raise SystemExit("--duration and --schema-seconds must be non-negative")
+
+    # Join the shared pulse barrier BEFORE touching the serial port, so the AGX
+    # sits idle-armed (like the nanos) with the pulse amplifier off. The first
+    # edge after power-on latches event_time; every CV7 row is then stamped with
+    # T_from_pulse against that same pulse the images use.
+    if not args.no_pps:
+        arm_and_wait_for_pulse(args.pps_pin, args.pps_timeout)
 
     gui_enabled = args.gui or args.gui_no_launch
     if gui_enabled and not (1 <= args.gui_port <= 65534):
