@@ -35,7 +35,7 @@ import time
 import Jetson.GPIO as GPIO
 
 # --- Camera identifier: set this for each camera script ---
-CAMERA_ID = "right"  # Change to "mid" or "right" for each camera
+CAMERA_ID = "mid"  # Change to "mid" or "right" for each camera
 
 PORT_MAP = {
     "left": [5001, 6000],
@@ -64,9 +64,9 @@ PORTS = PORT_MAP[CAMERA_ID]
 TARGET_PORT = PORTS[0]   # same port as before, now used for TCP image streaming
 stop_event = threading.Event()
 event_time = 0.0
-frameRate = 200
-exposureTime = 5000
-gain = None
+frameRate = 435
+exposureTime = 1000
+gain = 10
 stats_lock = threading.Lock()
 captured_frames = 0
 encoded_frames = 0
@@ -1336,7 +1336,7 @@ def print_trigger_config(nodemap, s_node_map, triggerType="software"):
 
 def main():
     global system, x, event_time
-    savedir = r"/home/ryan6/Alex/Blackfky/road_test_2"
+    savedir = r"/home/ryan5/Alex/Blackfky/road_test_2"
     PPS_PIN = 7
     x = 1
     pps = 0
@@ -1352,16 +1352,16 @@ def main():
     print("----------------------------------\n")
 
     try:
-        #while pps < 1:
-         #   edge = GPIO.wait_for_edge(PPS_PIN, GPIO.RISING, timeout=1000)
-          #  if edge is None:
-           #     continue
+        while pps < 1:
+            edge = GPIO.wait_for_edge(PPS_PIN, GPIO.RISING, timeout=1000)
+            if edge is None:
+                continue
 
-        event_time = get_tow_from_utc()
-        #    print(f"[{event_time}] 🟢 PPS Trigger Received!")
+            event_time = get_tow_from_utc()
+            print(f"[{event_time}] 🟢 PPS Trigger Received!")
 
-         #   time.sleep(0.1)
-          #  pps = 1
+            time.sleep(0.1)
+            pps = 1
 
     except KeyboardInterrupt:
         print("\nExiting...")
