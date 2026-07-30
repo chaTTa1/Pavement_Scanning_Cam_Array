@@ -457,7 +457,12 @@ def image_proc_thread(save_q, time_q, savedir, stop_event):
 
             final_packet = frame.tobytes()
             #print(f"[image_proc] encoded bytes={len(final_packet)} frame_id={frame_id}")
-            exif_byte = exif_bytes('Flir', 'BlackFly', frame_time, 6)
+            # SHARED-PULSE-EPOCH: carry BOTH the per-frame offset (time since pulse)
+            # AND the absolute pulse epoch (event_time = GPS TOW latched at the PPS edge).
+            # The AGX has no PPS wire, so it learns the pulse origin from this EXIF field.
+            # Backward compatible: legacy readers still parse the leading T_from_pulse float.
+            comment = f"T_from_pulse={frame_time};pulse_tow={event_time:.4f}"
+            exif_byte = exif_bytes('Flir', 'BlackFly', comment, 6)
             #print(len(exif_byte))
             #print(len(final_packet))
             drop_oldest_and_put(stream_q, (frame_id, final_packet, exif_byte), "stream")
