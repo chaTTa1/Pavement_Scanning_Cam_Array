@@ -23,8 +23,15 @@ from matplotlib.ticker import FormatStrFormatter
 from scipy.optimize import least_squares
 
 
-data_dir = Path(r"E:\SynologyDrive\paper\road_defect_detection_data\DLT_test_Sept24\DLT_test_Sept24")
-gps_file = data_dir / "GPS_points.csv"
+# data_dir = Path(r"E:\SynologyDrive\paper\road_defect_detection_data\DLT_test_Sept24\DLT_test_Sept24")
+
+data_dir = Path(r"E:\SynologyDrive\paper\road_defect_detection_data\DLT_test_Oct_15\orginaze")
+
+detection_target = "white_sphere"  # "black_dot" or "white_sphere"; applies to all cameras in this run.
+# Before calibration, this CSV must contain GPS rows for the selected target.
+# gps_file = data_dir / "GPS_points.csv"
+gps_file = data_dir / "GPS_points_sphere.csv"
+
 output_dir = Path(__file__).resolve().parent / "DLT_results_Sept24"
 camera_prefixes = {"camera_1": "left", "camera_2": "mid", "camera_3": "right"}
 
@@ -36,18 +43,29 @@ camera_prefixes = {"camera_1": "left", "camera_2": "mid", "camera_3": "right"}
 # None allows image review but deliberately prevents an incorrect calibration.
 # User assumption: the circle stays vertically 4 cm below the antenna point.
 antenna_to_circle_enu_m = [0.0, 0.0, -0.04]
+antenna_to_sphere_enu_m = [0.0, 0.0, -0.08]  # Measured [dEast, dNorth, dUp] from the sphere antenna to sphere center.
 
 # All frames are reviewed by default. Set >0 to auto-advance unambiguous
 # automatic detections after this many milliseconds; failed/manual frames pause.
 preview_delay_ms = 0
 preview_scale = 1.0
 reuse_reviewed_centers = True
-review_saved_centers = False  # True to inspect already accepted frames again.
+review_saved_centers = False  # True to inspect accepted/discarded frames again and allow restoration.
 save_annotated_images = True
+circle_center_method = "ellipse"  # "ellipse" or binary-area "centroid"; C switches during review.
+minimum_partial_arc_deg = 180.0  # Require at least a half-ellipse span for image-edge extrapolation.
 
 # Detection settings for these 720 x 540 images; all areas are ORIGINAL pixels.
 blob_min_area = 2.0
-blob_max_area = 600.0
+blob_max_area = 2000
+sphere_blob_max_area = None  # White spheres are larger; None leaves the upper area bound to the ROI/image.
+sphere_edge_step_px = 0.5
+sphere_edge_angle_step_deg = 2.0
+sphere_edge_span_px = 2.0  # Measure the outward intensity drop over this distance.
+sphere_edge_fit_tolerance_px = 1.0  # Maximum scaled radial ellipse residual, in pixels.
+sphere_edge_candidates_per_ray = 4
+sphere_ellipse_trials = 256
+sphere_ellipse_seed = 0  # Repeatable consensus fits when shadow and silhouette edges compete.
 minimum_dot_contrast = 25.0
 minimum_white_ring = 180.0
 candidate_score_ratio = 1.4
@@ -140,8 +158,142 @@ def find_camera_images(folder, prefix, point_count):
     return [files[point_id] for point_id in range(1, point_count + 1)]
 
 
-def refine_circle(gray, rectangle):
-    """Fit an ellipse to subpixel intensity crossings around an isolated dark dot."""
+def find_sphere_edge_points(patch, center_x, center_y, core_radius):
+    """Choose one silhouette edge per ray by ellipse consensus, in local patch pixels."""
+    angles = np.radians(np.arange(0.0, 360.0, sphere_edge_angle_step_deg))
+    radii = np.arange(core_radius, np.hypot(patch.shape[1], patch.shape[0]), sphere_edge_step_px)
+    map_x = center_x + np.cos(angles).reshape(-1, 1) * radii.reshape(1, -1)
+    map_y = center_y + np.sin(angles).reshape(-1, 1) * radii.reshape(1, -1)
+    profiles = cv2.remap(patch.astype(np.float32), map_x.astype(np.float32), map_y.astype(np.float32),
+                         cv2.INTER_LINEAR)
+    valid = (map_x >= 0) & (map_x <= patch.shape[1] - 1) & (map_y >= 0) & (map_y <= patch.shape[0] - 1)
+    span_steps = max(1, round(sphere_edge_span_px / sphere_edge_step_px))
+    if len(radii) <= span_steps:
+        return None
+    drops = profiles[:, :-span_steps] - profiles[:, span_steps:]
+    # Both samples must be in the image. remap padding must never create a false edge.
+    drops[~(valid[:, :-span_steps] & valid[:, span_steps:])] = -np.inf
+    candidates = np.zeros((len(angles), sphere_edge_candidates_per_ray, 2), dtype=np.float32)
+    candidate_radii = np.zeros((len(angles), sphere_edge_candidates_per_ray))
+    candidate_counts = np.zeros(len(angles), dtype=int)
+    for index in range(len(angles)):
+        before = drops[index, :-2]
+        middle = drops[index, 1:-1]
+        after = drops[index, 2:]
+        # Only complete local maxima are edges; truncated image-boundary peaks are excluded.
+        peaks = np.flatnonzero(np.isfinite(before) & np.isfinite(after)
+                              & (middle >= minimum_dot_contrast)
+                              & (middle > before) & (middle >= after)) + 1
+        peaks = peaks[np.argsort(-drops[index, peaks], kind="stable")]
+        for peak in peaks:
+            before, middle, after = drops[index, peak - 1:peak + 2]
+            curvature = before - 2 * middle + after
+            offset = 0.5 * (before - after) / curvature if curvature < 0 else 0.0
+            radius = radii[peak] + (span_steps / 2 + offset) * sphere_edge_step_px
+            count = candidate_counts[index]
+            # Nearby peaks from one blurred transition are not independent candidates.
+            if np.any(np.abs(candidate_radii[index, :count] - radius) < sphere_edge_span_px):
+                continue
+            candidate_radii[index, count] = radius
+            candidates[index, count] = [center_x + radius * np.cos(angles[index]),
+                                        center_y + radius * np.sin(angles[index])]
+            candidate_counts[index] += 1
+            if candidate_counts[index] == sphere_edge_candidates_per_ray:
+                break
+    available_rays = np.flatnonzero(candidate_counts > 0)
+    if len(available_rays) < 5:
+        return None
+    candidate_slots = np.arange(sphere_edge_candidates_per_ray).reshape(1, -1)
+    valid_candidates = candidate_slots < candidate_counts.reshape(-1, 1)
+    random = np.random.default_rng(sphere_ellipse_seed)
+    hypotheses = []
+    # Start from strongest/outermost/innermost peaks, then test five-ray ellipse hypotheses.
+    # Each ray casts only one vote, so multiple shadow edges cannot increase its weight.
+    for trial in range(3 + sphere_ellipse_trials):
+        if trial < 3:
+            ranks = np.zeros(len(available_rays), dtype=int)
+            for index, ray in enumerate(available_rays):
+                if trial == 1:
+                    ranks[index] = np.argmax(candidate_radii[ray, :candidate_counts[ray]])
+                elif trial == 2:
+                    ranks[index] = np.argmin(candidate_radii[ray, :candidate_counts[ray]])
+            sample = candidates[available_rays, ranks]
+        else:
+            rays = random.choice(available_rays, size=5, replace=False)
+            ranks = random.integers(candidate_counts[rays])
+            sample = candidates[rays, ranks]
+        hypothesis = None
+        # Refine each hypothesis before ranking; a noisy five-point fit can have a good consensus.
+        for _ in range(4):
+            hypothesis = None
+            (cx, cy), (width, height), angle = cv2.fitEllipse(sample)
+            if (not np.isfinite([cx, cy, width, height, angle]).all() or min(width, height) <= 0
+                    or max(width, height) > 2 * max(patch.shape)
+                    or not (0 <= cx < patch.shape[1] and 0 <= cy < patch.shape[0])):
+                break
+            theta = np.radians(angle)
+            seed_width = (np.cos(theta) * (center_x - cx) + np.sin(theta) * (center_y - cy)) / (width / 2)
+            seed_height = (-np.sin(theta) * (center_x - cx) + np.cos(theta) * (center_y - cy)) / (height / 2)
+            if np.hypot(seed_width, seed_height) >= 1:
+                break
+            # Count only directions measurable inside the patch; off-image arcs cast no vote.
+            direction_width = np.cos(angles - theta) / (width / 2)
+            direction_height = np.sin(angles - theta) / (height / 2)
+            quadratic_a = direction_width ** 2 + direction_height ** 2
+            quadratic_b = 2 * (seed_width * direction_width + seed_height * direction_height)
+            quadratic_c = seed_width ** 2 + seed_height ** 2 - 1
+            discriminant = quadratic_b ** 2 - 4 * quadratic_a * quadratic_c
+            edge_radius = (-quadratic_b + np.sqrt(discriminant)) / (2 * quadratic_a)
+            margin = sphere_edge_span_px / 2 + sphere_edge_step_px
+            measurable = np.ones(len(angles), dtype=bool)
+            for sample_radius in (edge_radius - margin, edge_radius + margin):
+                sample_x = center_x + sample_radius * np.cos(angles)
+                sample_y = center_y + sample_radius * np.sin(angles)
+                measurable &= ((sample_x >= 0) & (sample_x <= patch.shape[1] - 1)
+                               & (sample_y >= 0) & (sample_y <= patch.shape[0] - 1))
+            dx = candidates[:, :, 0] - cx
+            dy = candidates[:, :, 1] - cy
+            along_width = (np.cos(theta) * dx + np.sin(theta) * dy) / (width / 2)
+            along_height = (-np.sin(theta) * dx + np.cos(theta) * dy) / (height / 2)
+            residuals = np.abs(np.hypot(along_width, along_height) - 1) * min(width, height) / 2
+            residuals[~valid_candidates] = np.inf
+            ranks = np.argmin(residuals, axis=1)
+            rays = np.arange(len(angles))
+            keep = measurable & (residuals[rays, ranks] <= sphere_edge_fit_tolerance_px)
+            rays = rays[keep]
+            ranks = ranks[keep]
+            if len(rays) < 5:
+                break
+            edge_angles = np.sort(np.arctan2(along_height[rays, ranks], along_width[rays, ranks]))
+            gaps = np.diff(np.append(edge_angles, edge_angles[0] + 2 * np.pi))
+            if 360 - np.degrees(np.max(gaps)) < minimum_partial_arc_deg:
+                break
+            points = candidates[rays, ranks]
+            # Residual-weighted support penalizes mixed shadow/background contours.
+            # The radial extent favors the outer silhouette over a well-fitted internal shadow.
+            fit_quality = 1 - residuals[rays, ranks] / sphere_edge_fit_tolerance_px
+            support = float(np.sum(fit_quality)) / np.count_nonzero(measurable)
+            score = support * float(np.median(candidate_radii[rays, ranks]))
+            hypothesis = (score, len(rays), -float(np.mean(residuals[rays, ranks])), points)
+            if np.array_equal(points, sample):
+                break
+            sample = points
+        if hypothesis is not None:
+            hypotheses.append(hypothesis)
+    if not hypotheses:
+        return None
+    hypotheses.sort(key=lambda item: item[:3], reverse=True)
+    return hypotheses[0][3]
+
+
+def refine_circle(gray, rectangle, center_method=None):
+    """Measure ellipse center and binary-area centroid in original u,v pixels."""
+    if detection_target not in ("black_dot", "white_sphere"):
+        raise ValueError("detection_target must be 'black_dot' or 'white_sphere'.")
+    if center_method is None:
+        center_method = circle_center_method
+    if center_method not in ("ellipse", "centroid"):
+        raise ValueError("circle_center_method must be 'ellipse' or 'centroid'.")
     x1, y1, x2, y2 = rectangle
     center_x = (x1 + x2) / 2.0
     center_y = (y1 + y2) / 2.0
@@ -154,37 +306,67 @@ def refine_circle(gray, rectangle):
     yy, xx = np.indices(patch.shape)
     distance = np.hypot(xx - (center_x - left), yy - (center_y - top))
     core_radius = max(2.0, min(x2 - x1, y2 - y1) / 4.0)
-    dark = float(np.min(patch[distance <= core_radius]))
-    light = float(np.percentile(patch, 95))
+    if detection_target == "black_dot":
+        dark = float(np.min(patch[distance <= core_radius]))
+        light = float(np.percentile(patch, 95))
+        max_area = blob_max_area
+    else:
+        dark = float(np.percentile(patch, 5))
+        light = float(np.max(patch[distance <= core_radius]))
+        max_area = sphere_blob_max_area
     if light - dark < minimum_dot_contrast:
         return None
     threshold = (dark + light) / 2.0
-    mask = np.uint8(patch < threshold)
+    if detection_target == "black_dot":
+        mask = np.uint8(patch < threshold)
+    else:
+        mask = np.uint8(patch > threshold)
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
     target = None
+    partial = False
     best_distance = max(3.0, min(x2 - x1, y2 - y1) / 2.0)
     for index in range(1, count):
         x, y, width, height, area = stats[index]
         cx, cy = centroids[index]
-        if x == 0 or y == 0 or x + width >= patch.shape[1] or y + height >= patch.shape[0]:
+        touches_left = x == 0
+        touches_top = y == 0
+        touches_right = x + width >= patch.shape[1]
+        touches_bottom = y + height >= patch.shape[0]
+        # An ROI cutting the dot must be enlarged. At an actual image edge,
+        # fit the remaining arc; no artificial closing edge is added below.
+        roi_cuts_component = ((touches_left and left > 0) or (touches_top and top > 0)
+                or (touches_right and right < gray.shape[1])
+                or (touches_bottom and bottom < gray.shape[0]))
+        if detection_target == "black_dot" and roi_cuts_component:
             continue
-        if area < 2 or area > blob_max_area:
+        if area < 2 or (detection_target == "black_dot" and max_area is not None and area > max_area):
             continue
         offset = np.hypot(cx + left - center_x, cy + top - center_y)
         if offset < best_distance:
             best_distance = offset
             target = index
+            partial = touches_left or touches_top or touches_right or touches_bottom
     if target is None:
         return None
 
     component = labels == target
-    crossings = []
-    for y, x in np.argwhere(component[:, 1:] != component[:, :-1]):
-        fraction = (threshold - patch[y, x]) / (patch[y, x + 1] - patch[y, x])
-        crossings.append([left + x + fraction, top + y])
-    for y, x in np.argwhere(component[1:, :] != component[:-1, :]):
-        fraction = (threshold - patch[y, x]) / (patch[y + 1, x] - patch[y, x])
-        crossings.append([left + x, top + y + fraction])
+    # Equal weight per foreground pixel, not an intensity-weighted center.
+    moments = cv2.moments(np.uint8(component), binaryImage=True)
+    centroid_x = left + moments["m10"] / moments["m00"]
+    centroid_y = top + moments["m01"] / moments["m00"]
+    if detection_target == "black_dot":
+        crossings = []
+        for y, x in np.argwhere(component[:, 1:] != component[:, :-1]):
+            fraction = (threshold - patch[y, x]) / (patch[y, x + 1] - patch[y, x])
+            crossings.append([left + x + fraction, top + y])
+        for y, x in np.argwhere(component[1:, :] != component[:-1, :]):
+            fraction = (threshold - patch[y, x]) / (patch[y + 1, x] - patch[y, x])
+            crossings.append([left + x, top + y + fraction])
+    else:
+        edge_points = find_sphere_edge_points(patch, center_x - left, center_y - top, core_radius)
+        if edge_points is None:
+            return None
+        crossings = edge_points + np.array([left, top])
     if len(crossings) < 5:
         return None
     ellipse = cv2.fitEllipse(np.array(crossings, dtype=np.float32))
@@ -193,18 +375,69 @@ def refine_circle(gray, rectangle):
         return None
     if not (x1 <= cx <= x2 and y1 <= cy <= y2):
         return None
-    radius = np.sqrt(np.count_nonzero(component) / np.pi)
-    distance = np.hypot(xx - (cx - left), yy - (cy - top))
-    ring = patch[(distance > 1.2 * radius) & (distance < 1.7 * radius)]
+    boundary = np.array(crossings, dtype=float)
+    theta = np.radians(angle)
+    if detection_target == "white_sphere":
+        if max_area is not None and np.pi * width * height / 4 > max_area:
+            return None
+        extent_x = np.hypot(width * np.cos(theta), height * np.sin(theta)) / 2
+        extent_y = np.hypot(width * np.sin(theta), height * np.cos(theta)) / 2
+        if ((left > 0 and cx - extent_x < left) or (top > 0 and cy - extent_y < top)
+                or (right < gray.shape[1] and cx + extent_x > right - 1)
+                or (bottom < gray.shape[0] and cy + extent_y > bottom - 1)):
+            return None
+        partial = (cx - extent_x <= 0 or cy - extent_y <= 0
+                   or cx + extent_x >= gray.shape[1] - 1 or cy + extent_y >= gray.shape[0] - 1)
+    boundary_x = boundary[:, 0] - cx
+    boundary_y = boundary[:, 1] - cy
+    along_width = np.cos(theta) * boundary_x + np.sin(theta) * boundary_y
+    along_height = -np.sin(theta) * boundary_x + np.cos(theta) * boundary_y
+    boundary_angles = np.sort(np.arctan2(along_height / (height / 2), along_width / (width / 2)))
+    angle_gaps = np.diff(np.append(boundary_angles, boundary_angles[0] + 2 * np.pi))
+    visible_arc_deg = float(360.0 - np.degrees(np.max(angle_gaps)))
+    if (partial or detection_target == "white_sphere") and visible_arc_deg < minimum_partial_arc_deg:
+        return None
+    # Follow the fitted ellipse so an elongated target cannot enter its own white ring.
+    dx = xx - (cx - left)
+    dy = yy - (cy - top)
+    along_width = np.cos(theta) * dx + np.sin(theta) * dy
+    along_height = -np.sin(theta) * dx + np.cos(theta) * dy
+    ellipse_radius = np.hypot(along_width / (width / 2), along_height / (height / 2))
+    if detection_target == "white_sphere":
+        # The comparison centroid uses bright pixels inside the measured silhouette,
+        # excluding adjacent white clothing/board connected to the initial bright region.
+        component = (mask != 0) & (ellipse_radius <= 1)
+        moments = cv2.moments(np.uint8(component), binaryImage=True)
+        if moments["m00"] < 2:
+            return None
+        centroid_x = left + moments["m10"] / moments["m00"]
+        centroid_y = top + moments["m01"] / moments["m00"]
+    ring = patch[(ellipse_radius > 1.2) & (ellipse_radius < 1.7) & ~component]
     ring_gray = float(np.median(ring)) if ring.size else 0.0
-    return {"u": float(cx), "v": float(cy), "axes": [float(width), float(height)],
+    selected_x, selected_y = cx, cy
+    method = "intensity_ellipse" if detection_target == "black_dot" else "edge_ellipse"
+    if partial:
+        # The visible-area centroid is biased by clipping and is not a calibration center.
+        center_method = "ellipse"
+    if center_method == "centroid":
+        selected_x, selected_y = centroid_x, centroid_y
+        method = "area_centroid"
+    if not (x1 <= selected_x <= x2 and y1 <= selected_y <= y2):
+        return None
+    return {"u": float(selected_x), "v": float(selected_y), "axes": [float(width), float(height)],
             "angle": float(angle), "contrast": light - dark, "ring_gray": ring_gray,
-            "method": "intensity_ellipse"}
+            "foreground_gray": float(np.median(patch[component])), "target_type": detection_target,
+            "ellipse_center": [float(cx), float(cy)],
+            "centroid": [float(centroid_x), float(centroid_y)],
+            "partial": bool(partial), "visible_arc_deg": visible_arc_deg,
+            "center_method": center_method, "roi": [float(x1), float(y1), float(x2), float(y2)],
+            "method": method}
 
 
 def detect_camera_targets(files, preview_window=None):
-    # Adapted from the supplied SimpleBlobDetector example for ONE small black
-    # circle, not a 4 x 11 grid. No findCirclesGrid or image rescaling is used.
+    # Blob detection proposes candidates; the local outline determines the center.
+    if detection_target not in ("black_dot", "white_sphere"):
+        raise ValueError("detection_target must be 'black_dot' or 'white_sphere'.")
     params = cv2.SimpleBlobDetector_Params()
     params.minThreshold = 10
     params.maxThreshold = 255
@@ -212,10 +445,11 @@ def detect_camera_targets(files, preview_window=None):
     params.minRepeatability = 2
     params.minDistBetweenBlobs = 2
     params.filterByColor = True
-    params.blobColor = 0
+    params.blobColor = 0 if detection_target == "black_dot" else 255
     params.filterByArea = True
     params.minArea = blob_min_area
-    params.maxArea = blob_max_area
+    max_area = blob_max_area if detection_target == "black_dot" else sphere_blob_max_area
+    params.maxArea = max_area if max_area is not None else np.finfo(np.float32).max
     params.filterByCircularity = True
     params.minCircularity = 0.25
     params.filterByConvexity = True
@@ -246,7 +480,12 @@ def detect_camera_targets(files, preview_window=None):
             x, y = point.pt
             radius = max(3.0, point.size / 2.0 + 2.0)
             candidate = refine_circle(gray, (x - radius, y - radius, x + radius, y + radius))
-            if candidate is None or candidate["ring_gray"] < minimum_white_ring:
+            if candidate is None:
+                continue
+            if detection_target == "black_dot":
+                if candidate["ring_gray"] < minimum_white_ring:
+                    continue
+            elif candidate["foreground_gray"] - candidate["ring_gray"] < minimum_dot_contrast:
                 continue
             ratio = min(candidate["axes"]) / max(candidate["axes"])
             candidate["score"] = candidate["contrast"] * ratio
@@ -269,11 +508,14 @@ def detect_camera_targets(files, preview_window=None):
                 usable.append(candidate)
         usable.sort(key=lambda item: item["score"], reverse=True)
         if not usable:
-            detections.append((None, "Detection failed. Drag an ellipse around the dot."))
+            detections.append((None, "Detection failed. Draw a rectangle around the selected target."))
         elif len(usable) > 1 and usable[0]["score"] < candidate_score_ratio * usable[1]["score"]:
-            detections.append((None, "Several candidates. Drag around the correct dot."))
+            detections.append((None, "Several candidates. Draw a rectangle around the correct target."))
         else:
-            detections.append((usable[0], "Automatic ellipse: check center, then Enter."))
+            message = "Automatic target: check center; C compares methods."
+            if usable[0]["partial"]:
+                message = "Image-edge clipping: fitted ellipse center. Check, then Enter."
+            detections.append((usable[0], message))
     return detections, image_size
 
 
@@ -298,53 +540,95 @@ def mouse_select_circle(event, x, y, flags, state):
             x1, x2 = sorted([state["start"][0], point[0]])
             y1, y2 = sorted([state["start"][1], point[1]])
             if x2 - x1 < 2 or y2 - y1 < 2:
-                state["message"] = "Selection too small. Drag again around the complete circle."
+                state["message"] = "Rectangle too small. Enclose the visible target."
                 return
-            target = refine_circle(state["gray"], (x1, y1, x2, y2))
+            target = refine_circle(state["gray"], (x1, y1, x2, y2), state["center_method"])
             if target is None:
-                # Explicit user-drawn ellipse fallback, never an invented auto-center.
-                target = {"u": (x1 + x2) / 2, "v": (y1 + y2) / 2,
-                          "axes": [x2 - x1, y2 - y1], "angle": 0.0,
-                          "method": "manual_drawn_ellipse"}
-                state["message"] = "Manual ellipse center. Check/adjust the drag, then Enter."
+                # A rectangular ROI locates the target; its midpoint is not a measurement.
+                state["message"] = "Fit failed. Adjust ROI; clipped targets need more visible arc."
             else:
-                target["method"] = "manual_roi_intensity_ellipse"
-                state["message"] = "Circle refined inside selection. Check, then Enter."
+                target["method"] = "manual_roi_" + target["method"]
+                state["discarded"] = False
+                state["center_method"] = target["center_method"]
+                state["message"] = "Target measured inside rectangle. C compares centers."
+                if target["partial"]:
+                    state["message"] = "Image-edge clipping: fitted ellipse center. Check, then Enter."
             state["target"] = target
+
+
+def switch_circle_center(state):
+    target = state["target"]
+    if target is not None and target["partial"]:
+        state["message"] = "Clipped target: use ellipse center; visible centroid is biased."
+        return
+    state["center_method"] = "centroid" if state["center_method"] == "ellipse" else "ellipse"
+    state["manual"] = True
+    if target is None:
+        state["message"] = f"Selected center: {state['center_method']}. Draw a rectangle."
+        return
+    target["center_method"] = state["center_method"]
+    if state["center_method"] == "centroid":
+        target["u"], target["v"] = target["centroid"]
+        method = "area_centroid"
+    else:
+        target["u"], target["v"] = target["ellipse_center"]
+        method = "edge_ellipse" if target.get("target_type") == "white_sphere" else "intensity_ellipse"
+    prefix = "manual_roi_" if target["method"].startswith("manual_roi_") else ""
+    target["method"] = prefix + method
+    state["message"] = f"Selected center: {state['center_method']}. Check, then Enter."
 
 
 def draw_target_preview(image, state, title):
     scale = state["scale"]
     height, width = image.shape[:2]
     display = cv2.resize(image, (round(width * scale), round(height * scale)))
+    if state.get("discarded", False):
+        cv2.putText(display, "DISCARDED", (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 0, 255), 2, cv2.LINE_AA)
     target = state["target"]
     if target is not None:
-        center = (target["u"] * scale, target["v"] * scale)
+        center = (target["ellipse_center"][0] * scale, target["ellipse_center"][1] * scale)
         axes = (target["axes"][0] * scale, target["axes"][1] * scale)
         color = (0, 180, 255) if state["manual"] else (0, 255, 0)
         cv2.ellipse(display, (center, axes, target["angle"]), color, 1, cv2.LINE_AA)
-        pixel = (round(center[0]), round(center[1]))
+        other_center = target["centroid"] if target["center_method"] == "ellipse" else target["ellipse_center"]
+        other_pixel = (round(other_center[0] * scale), round(other_center[1] * scale))
+        cv2.drawMarker(display, other_pixel, (255, 255, 0), cv2.MARKER_TILTED_CROSS, 7, 1)
+        pixel = (round(target["u"] * scale), round(target["v"] * scale))
         cv2.drawMarker(display, pixel, (0, 0, 255), cv2.MARKER_CROSS, 9, 1)
         position = (max(0, min(pixel[0] + 9, display.shape[1] - 175)),
                     max(16, min(pixel[1] - 9, display.shape[0] - 5)))
         cv2.putText(display, f"({target['u']:.2f}, {target['v']:.2f})", position,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-    if state["dragging"]:
+    if state["start"] is not None and state["end"] is not None:
         x1, y1 = state["start"]
         x2, y2 = state["end"]
-        center = ((x1 + x2) * scale / 2, (y1 + y2) * scale / 2)
-        axes = (max(1.0, abs(x2 - x1) * scale), max(1.0, abs(y2 - y1) * scale))
-        cv2.ellipse(display, (center, axes, 0.0), (0, 180, 255), 1, cv2.LINE_AA)
+        top_left = (round(min(x1, x2) * scale), round(min(y1, y2) * scale))
+        bottom_right = (round(max(x1, x2) * scale), round(max(y1, y2) * scale))
+        cv2.rectangle(display, top_left, bottom_right, (0, 180, 255), 1, cv2.LINE_AA)
     canvas = cv2.copyMakeBorder(display, 0, 155, 0, 0, cv2.BORDER_CONSTANT, value=(28, 28, 28))
-    lines = [title, state["message"], "Drag: select/reselect circle | Enter/Space: accept",
-             "R: clear | A: auto detect | B: previous | Q/Esc: save and quit"]
+    lines = [title, state["message"], "Drag: rectangle | Enter/Space: accept | D: discard",
+             "C: ellipse/centroid | R: clear | A: auto | B: back | Q/Esc: quit"]
     if target is not None:
         lines.append(f"u={target['u']:.4f}, v={target['v']:.4f} px | {target['method']}")
+        separation = np.linalg.norm(np.array(target["ellipse_center"]) - target["centroid"])
+        if target["partial"]:
+            lines.append(f"Partial: {target['visible_arc_deg']:.0f} deg arc | Cyan: visible centroid, not used")
+        else:
+            lines.append(f"Red: selected | Cyan: alternative | Difference: {separation:.3f} px")
         x, y = round(target["u"]), round(target["v"])
-        crop = image[max(0, y - 12):min(height, y + 13), max(0, x - 12):min(width, x + 13)]
+        zoom_radius = max(12, int(np.ceil(max(target["axes"]) / 2)) + 4)
+        zoom_size = min(2 * zoom_radius + 1, width, height)
+        # Shift the square crop inside the image instead of stretching an edge-clipped crop.
+        crop_left = max(0, min(x - zoom_radius, width - zoom_size))
+        crop_top = max(0, min(y - zoom_radius, height - zoom_size))
+        crop = image[crop_top:crop_top + zoom_size, crop_left:crop_left + zoom_size]
         zoom = cv2.resize(crop, (140, 140), interpolation=cv2.INTER_NEAREST)
-        cx = (target["u"] - max(0, x - 12) + 0.5) * 140 / crop.shape[1] - 0.5
-        cy = (target["v"] - max(0, y - 12) + 0.5) * 140 / crop.shape[0] - 0.5
+        cx = (target["u"] - crop_left + 0.5) * 140 / crop.shape[1] - 0.5
+        cy = (target["v"] - crop_top + 0.5) * 140 / crop.shape[0] - 0.5
+        other_x = (other_center[0] - crop_left + 0.5) * 140 / crop.shape[1] - 0.5
+        other_y = (other_center[1] - crop_top + 0.5) * 140 / crop.shape[0] - 0.5
+        cv2.drawMarker(zoom, (round(other_x), round(other_y)), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 9, 1)
         cv2.drawMarker(zoom, (round(cx), round(cy)), (0, 0, 255), cv2.MARKER_CROSS, 11, 1)
         canvas[display.shape[0] + 7:display.shape[0] + 147, -147:-7] = zoom
     for index, text in enumerate(lines):
@@ -355,15 +639,44 @@ def draw_target_preview(image, state, title):
     return canvas
 
 
+def save_frame_review(cache, camera, path, point_id, target, discarded, cache_file):
+    """Persist a reviewed or discarded frame without changing the source image."""
+    if not discarded and target is None:
+        raise ValueError("Accepting a frame requires a measured target center.")
+    stat = path.stat()
+    cache["cameras"][camera][path.name] = {
+        "point_id": point_id, "target": None if discarded else target,
+        "discarded": discarded, "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    temporary = cache_file.with_suffix(".tmp")
+    temporary.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    temporary.replace(cache_file)
+
+
 def review_circle_centers(camera_files, cache_file, run_dir):
     if preview_scale <= 0:
         raise ValueError("preview_scale must be positive.")
-    cache = {"data_dir": str(data_dir.resolve()), "image_coordinates": "original zero-based u,v pixels", "cameras": {}}
+    if circle_center_method not in ("ellipse", "centroid"):
+        raise ValueError("circle_center_method must be 'ellipse' or 'centroid'.")
+    center_definition = "ellipse_and_area_centroid_edge_v1"
+    if detection_target == "white_sphere":
+        center_definition = "sphere_multi_edge_consensus_v2"
+    cache = {"data_dir": str(data_dir.resolve()), "image_coordinates": "original zero-based u,v pixels",
+             "center_definition": center_definition, "default_center_method": circle_center_method,
+             "detection_target": detection_target,
+             "cameras": {}}
     if reuse_reviewed_centers and cache_file.exists():
         with cache_file.open(encoding="utf-8") as handle:
             saved = json.load(handle)
         if saved.get("data_dir") == cache["data_dir"]:
-            cache = saved
+            if (saved.get("center_definition") == cache["center_definition"]
+                    and saved.get("default_center_method") == circle_center_method
+                    and saved.get("detection_target", "black_dot") == detection_target):
+                cache = saved
+                cache["detection_target"] = detection_target
+            else:
+                backup_file = run_dir / "reviewed_centers_before_update.json"
+                backup_file.write_bytes(cache_file.read_bytes())
+                print("Target or center method changed; reviewing again. Previous centers saved in", backup_file)
     window = "DLT calibration - circle review"
     image_points = {}
     image_sizes = {}
@@ -388,19 +701,30 @@ def review_circle_centers(camera_files, cache_file, run_dir):
                 target = None if automatic is None else automatic.copy()
                 cached = reviewed.get(path.name)
                 stat = path.stat()
-                if cached and cached.get("size_bytes") == stat.st_size and cached.get("mtime_ns") == stat.st_mtime_ns:
+                if cached and (cached.get("size_bytes") != stat.st_size or cached.get("mtime_ns") != stat.st_mtime_ns):
+                    cached = None
+                discarded = cached is not None and cached.get("discarded", False)
+                if cached:
                     if not review_saved_centers and not revisit:
                         index += 1
                         continue
-                    target = cached["target"].copy()
-                    message = "Previously reviewed center. Check, then Enter."
+                    if discarded:
+                        target = None
+                        message = "Discarded. Draw a rectangle or A, then Enter to restore."
+                    else:
+                        target = cached["target"].copy()
+                        message = "Previously reviewed center. Check, then Enter."
                 state = {"gray": gray, "target": target, "scale": preview_scale,
                          "start": None, "end": None, "dragging": False,
-                         "manual": cached is not None, "message": message}
+                         "manual": cached is not None, "message": message, "discarded": discarded,
+                         "center_method": circle_center_method if target is None else target["center_method"]}
+                if target is not None and target["method"].startswith("manual_roi_"):
+                    state["start"] = target["roi"][:2]
+                    state["end"] = target["roi"][2:]
                 cv2.setMouseCallback(window, mouse_select_circle, state)
                 elapsed_ms = 0
                 while True:
-                    title = f"{camera} | {path.name} | GPS row {index + 1}/{len(files)}"
+                    title = f"{detection_target} | {camera} | {path.name} | {index + 1}/{len(files)}"
                     display = draw_target_preview(image, state, title)
                     cv2.imshow(window, display)
                     key = cv2.waitKey(20) & 0xFF
@@ -413,22 +737,42 @@ def review_circle_centers(camera_files, cache_file, run_dir):
                         break
                     if key == ord("r"):
                         state["target"] = None
+                        state["start"] = None
+                        state["end"] = None
+                        state["dragging"] = False
+                        state["discarded"] = False
                         state["manual"] = True
-                        state["message"] = "Drag an ellipse around the target circle."
+                        state["message"] = f"Draw a rectangle around the visible {detection_target.replace('_', ' ')}."
+                    elif key == ord("c"):
+                        switch_circle_center(state)
                     elif key == ord("a"):
                         state["target"] = None if automatic is None else automatic.copy()
+                        state["discarded"] = False
+                        state["start"] = None
+                        state["end"] = None
+                        state["dragging"] = False
+                        state["center_method"] = circle_center_method
                         state["manual"] = False
                         state["message"] = message
                         elapsed_ms = 0
                     elapsed_ms += 20
                     auto_accept = (preview_delay_ms > 0 and elapsed_ms >= preview_delay_ms
-                                   and not state["manual"] and not state["dragging"])
-                    if (key in (10, 13, 32) or auto_accept) and state["target"] is not None and not state["dragging"]:
-                        reviewed[path.name] = {"point_id": index + 1, "target": state["target"],
-                                               "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-                        temporary = cache_file.with_suffix(".tmp")
-                        temporary.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-                        temporary.replace(cache_file)
+                                   and not state["manual"] and not state["dragging"]
+                                   and state["target"] is not None and not state["target"]["partial"])
+                    discard = key in (ord("d"), ord("D"))
+                    accept = ((key in (10, 13, 32) or auto_accept)
+                              and state["target"] is not None and not state["dragging"])
+                    if discard or accept:
+                        if discard:
+                            state["target"] = None
+                            state["start"] = None
+                            state["end"] = None
+                            state["dragging"] = False
+                            state["discarded"] = True
+                            state["message"] = "DISCARDED. B on the next frame returns here."
+                            display = draw_target_preview(image, state, title)
+                            print(f"Discarded {camera}/{path.name} (target ID {index + 1}).", flush=True)
+                        save_frame_review(cache, camera, path, index + 1, state["target"], discard, cache_file)
                         if save_annotated_images:
                             destination = run_dir / camera
                             destination.mkdir(exist_ok=True)
@@ -437,11 +781,41 @@ def review_circle_centers(camera_files, cache_file, run_dir):
                         index += 1
                         revisit = False
                         break
-            image_points[camera] = np.array([[reviewed[path.name]["target"]["u"],
-                                              reviewed[path.name]["target"]["v"]] for path in files])
+            # Preserve original row positions; only explicitly discarded frames get missing coordinates.
+            image_points[camera] = np.full((len(files), 2), np.nan)
+            for index, path in enumerate(files):
+                entry = reviewed[path.name]
+                if not entry.get("discarded", False):
+                    image_points[camera][index] = [entry["target"]["u"], entry["target"]["v"]]
     finally:
         cv2.destroyAllWindows()
     return image_points, image_sizes, cache
+
+
+def select_calibration_points(image_points, camera_files, cache):
+    """Keep complete camera groups, retaining original GPS/image IDs after explicit discards."""
+    camera_names = list(camera_files)
+    point_count = len(camera_files[camera_names[0]])
+    keep = np.ones(point_count, dtype=bool)
+    discarded_frames = []
+    for camera, files in camera_files.items():
+        for index, path in enumerate(files):
+            if cache["cameras"][camera][path.name].get("discarded", False):
+                keep[index] = False
+                discarded_frames.append({"camera": camera, "point_id": index + 1, "filename": path.name})
+    selected = {}
+    for camera in camera_files:
+        selected[camera] = image_points[camera][keep]
+        if not np.isfinite(selected[camera]).all():
+            raise ValueError(f"{camera}: an accepted frame has invalid coordinates; no extra rows were removed.")
+    point_ids = np.arange(1, point_count + 1)
+    selection = {
+        "input_point_count": point_count,
+        "retained_point_ids": point_ids[keep].tolist(),
+        "excluded_point_ids": point_ids[~keep].tolist(),
+        "discarded_frames": discarded_frames,
+        "exclusion_policy": "A user-discarded frame excludes its target ID from all cameras in the joint calibration. Other camera reviews and source images are preserved."}
+    return selected, keep, selection
 
 
 def normalized_dlt(world_points, image_points):
@@ -689,17 +1063,21 @@ def triangulate_camera_points(cameras, image_points):
         fit = least_squares(triangulation_residuals, initial, args=(cameras, image_points[:, point]),
                             x_scale="jac", max_nfev=100)
         if not fit.success:
-            raise ValueError(f"Triangulation did not converge for point {point + 1}: {fit.message}")
+            raise ValueError(f"Triangulation did not converge for observation row {point + 1}: {fit.message}")
         for P in projections:
             if (P[:, :3] @ fit.x + P[:, 3])[2] <= 0:
-                raise ValueError(f"Triangulated point {point + 1} lies behind a camera.")
+                raise ValueError(f"Triangulated observation row {point + 1} lies behind a camera.")
         world_points.append(fit.x)
     return np.asarray(world_points)
 
 
-def validate_camera_array(gps_points, image_points):
+def validate_camera_array(gps_points, image_points, point_ids=None):
     """Exclude entire target positions, fit cameras, predict one view from the other two."""
     camera_count, point_count = image_points.shape[:2]
+    if point_ids is None:
+        point_ids = np.arange(1, point_count + 1)
+    else:
+        point_ids = np.asarray(point_ids)
     if camera_count != 3 or validation_folds < 2:
         raise ValueError("This validation requires three cameras and at least two folds.")
     rng = np.random.default_rng(validation_seed)
@@ -724,7 +1102,7 @@ def validate_camera_array(gps_points, image_points):
             predicted, _ = project_camera_points(cameras[camera], reconstructed)
             residuals[camera, test] = predicted - image_points[camera, test]
         fold_ids[test] = fold_index + 1
-        fold_results.append({"fold": fold_index + 1, "test_point_ids": (test + 1).tolist(),
+        fold_results.append({"fold": fold_index + 1, "test_point_ids": point_ids[test].tolist(),
                              "optimizer_converged": bool(fit.success), "optimizer_message": fit.message,
                              "camera_parameters": cameras.tolist()})
         print(f"Held-out validation: fold {fold_index + 1}/{validation_folds}; converged={fit.success}", flush=True)
@@ -742,12 +1120,16 @@ def validate_camera_array(gps_points, image_points):
     return summary, residuals, world_errors, fold_ids
 
 
-def bootstrap_camera_array(cameras, adjusted_points, gps_points, image_points, run_dir):
+def bootstrap_camera_array(cameras, adjusted_points, gps_points, image_points, run_dir, point_ids=None):
     """Resample complete target positions, retaining all three views in each draw."""
     if bootstrap_repetitions == 0:
         return {"status": "disabled", "repetitions": 0}
     if bootstrap_repetitions < 2:
         raise ValueError("Use at least two bootstrap repetitions, or 0 to disable.")
+    if point_ids is None:
+        point_ids = np.arange(1, len(gps_points) + 1)
+    else:
+        point_ids = np.asarray(point_ids)
     rng = np.random.default_rng(bootstrap_seed)
     camera_draws = []
     point_draws = []
@@ -770,14 +1152,14 @@ def bootstrap_camera_array(cameras, adjusted_points, gps_points, image_points, r
     # Save every draw, including any nonconverged fits; never silently discard.
     np.savez_compressed(run_dir / "bootstrap_samples.npz", camera_parameters=camera_draws,
                         reconstructed_world_points_m=point_draws,
-                        sampled_point_ids=np.asarray(sample_indices) + 1, converged=converged)
+                        point_ids=point_ids, sampled_point_ids=point_ids[np.asarray(sample_indices)], converged=converged)
     quantiles = np.quantile(camera_draws, [0.025, 0.5, 0.975], axis=0)
     point_std = np.std(point_draws, axis=0, ddof=1)
     with (run_dir / "bootstrap_reconstruction_spread.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["point_id", "std_E_m", "std_N_m", "std_U_m", "std_vector_norm_m"])
         for point, std in enumerate(point_std):
-            writer.writerow([point + 1, *std, np.linalg.norm(std)])
+            writer.writerow([point_ids[point], *std, np.linalg.norm(std)])
     return {
         "repetitions": bootstrap_repetitions, "seed": bootstrap_seed,
         "converged_count": sum(converged), "all_converged": all(converged),
@@ -948,14 +1330,27 @@ def plot_camera_residuals(camera, result, residuals, run_dir, axis_limit, valida
 
 
 def main():
+    if detection_target not in ("black_dot", "white_sphere"):
+        raise ValueError("detection_target must be 'black_dot' or 'white_sphere'.")
     gps_rows, antenna_points, metadata = load_gps_points(gps_file)
+    metadata["detection_target"] = detection_target
+    target_offset = antenna_to_circle_enu_m
+    gps_target_matches = True
+    cache_name = "reviewed_centers.json"
+    if detection_target == "white_sphere":
+        target_offset = antenna_to_sphere_enu_m
+        cache_name = "reviewed_centers_white_sphere.json"
+        gps_labels = [row.get("antenna", "").strip() for row in gps_rows]
+        gps_target_matches = all(label in ("", "sphere target") for label in gps_labels)
+        if target_offset is None or not gps_target_matches:
+            print("White sphere: image review is available; calibration needs matching sphere GPS and antenna_to_sphere_enu_m.")
     camera_files = {}
     for camera, prefix in camera_prefixes.items():
         camera_files[camera] = find_camera_images(data_dir / camera, prefix, len(gps_rows))
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = output_dir / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     run_dir.mkdir()
-    points, sizes, cache = review_circle_centers(camera_files, output_dir / "reviewed_centers.json", run_dir)
+    points, sizes, cache = review_circle_centers(camera_files, output_dir / cache_name, run_dir)
     if points is None:
         return
     with (run_dir / "image_points.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -963,29 +1358,54 @@ def main():
         writer.writerow(["camera", "point_id", "filename", "u_px", "v_px", "method"])
         for camera, files in camera_files.items():
             for index, path in enumerate(files):
-                target = cache["cameras"][camera][path.name]["target"]
-                writer.writerow([camera, index + 1, path.name, *points[camera][index], target["method"]])
-    if antenna_to_circle_enu_m is None:
-        metadata["status"] = "Image review complete; calibration awaits measured antenna-to-circle offsets."
+                entry = cache["cameras"][camera][path.name]
+                if entry.get("discarded", False):
+                    writer.writerow([camera, index + 1, path.name, "", "", "discarded"])
+                else:
+                    writer.writerow([camera, index + 1, path.name, *points[camera][index], entry["target"]["method"]])
+    points, keep, selection = select_calibration_points(points, camera_files, cache)
+    point_ids = np.asarray(selection["retained_point_ids"], dtype=int)
+    metadata.update(selection)
+    (run_dir / "frame_selection.json").write_text(json.dumps(selection, indent=2), encoding="utf-8")
+    print(f"Calibration set: {len(point_ids)}/{len(gps_rows)} complete target positions.")
+    if selection["excluded_point_ids"]:
+        print("Excluded target IDs after user discards:", selection["excluded_point_ids"])
+    pending_reasons = []
+    if target_offset is None or not gps_target_matches:
+        pending_reasons.append("Calibration awaits matching target GPS and measured antenna-to-target offsets.")
+    if len(point_ids) < 8:
+        pending_reasons.append("Fewer than 8 complete target positions remain; restore frames before calibration.")
+    elif validation_folds >= 2 and len(point_ids) - int(np.ceil(len(point_ids) / validation_folds)) < 8:
+        pending_reasons.append(f"Too few complete positions for {validation_folds}-fold validation with at least 8 training points per fold.")
+    if pending_reasons:
+        metadata["status"] = "Image review complete. " + " ".join(pending_reasons)
         (run_dir / "pending_calibration.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print("\nImage centers saved:", run_dir / "image_points.csv")
-        print("Calibration not run: GPS points are antenna locations. Set antenna_to_circle_enu_m first.")
+        for reason in pending_reasons:
+            print("Calibration not run:", reason)
         return
-    offsets = np.asarray(antenna_to_circle_enu_m, dtype=float)
+    offsets = np.asarray(target_offset, dtype=float)
     if offsets.shape == (3,):
         offsets = np.tile(offsets, (len(antenna_points), 1))
     if offsets.shape != antenna_points.shape or not np.isfinite(offsets).all():
-        raise ValueError("antenna_to_circle_enu_m must be a finite 3-vector or N by 3 array in WORLD E/N/U meters.")
+        raise ValueError("The selected antenna offset must be a finite 3-vector or N by 3 array in WORLD E/N/U meters.")
+    # Apply one common mask to GPS, per-row offsets and all cameras; original IDs remain unchanged.
+    gps_rows = [row for index, row in enumerate(gps_rows) if keep[index]]
+    antenna_points = antenna_points[keep]
+    offsets = offsets[keep]
     world_points = antenna_points + offsets
-    metadata["antenna_to_circle_enu_m"] = offsets.tolist()
+    offset_name = "antenna_to_circle_enu_m" if detection_target == "black_dot" else "antenna_to_sphere_enu_m"
+    metadata[offset_name] = offsets.tolist()
     metadata["offset_assumption"] = "User-configured antenna-to-circle displacement in local WORLD axes; no target-attitude correction applied."
     metadata["circle_center_perspective_bias"] = "Image ellipse centers are used; circle eccentricity is not corrected."
+    if detection_target == "white_sphere":
+        metadata["circle_center_perspective_bias"] = "Sphere silhouette ellipse centers are used; perspective displacement from the projected 3D sphere center is not corrected."
     with (run_dir / "world_points.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["point_id", "save_timestamp", "utc_time", "fix_quality", "latitude_deg", "longitude_deg", "gga_altitude_m",
                          "antenna_E_m", "antenna_N_m", "antenna_U_m", "circle_E_m", "circle_N_m", "circle_U_m"])
         for index, row in enumerate(gps_rows):
-            writer.writerow([index + 1, row.get("save_timestamp", ""), row.get("utc_time", ""),
+            writer.writerow([point_ids[index], row.get("save_timestamp", ""), row.get("utc_time", ""),
                              row.get("fix_quality", ""), row["latitude"], row["longitude"], row["altitude_m"],
                              *antenna_points[index], *world_points[index]])
     initial_results = {}
@@ -1016,13 +1436,13 @@ def main():
                          "adjusted_circle_E_m", "adjusted_circle_N_m", "adjusted_circle_U_m",
                          "delta_E_m", "delta_N_m", "delta_U_m", "correction_norm_m"])
         for index in range(len(world_points)):
-            writer.writerow([index + 1, *world_points[index], *adjusted_points[index],
+            writer.writerow([point_ids[index], *world_points[index], *adjusted_points[index],
                              *gps_corrections[index], gps_distances[index]])
 
     metadata["calibration_method"] = "DLT initialization followed by joint camera/3D-target bundle adjustment with soft GPS constraints"
     metadata["gps_regularization_m"] = gps_regularization_m
     metadata["gps_weight_meaning"] = "Algorithmic regularization: this many meters has the weight of 1 pixel. Not a measured GPS standard deviation."
-    metadata["loss"] = "soft_l1; all image observations and all GPS priors retained"
+    metadata["loss"] = "soft_l1; all image observations and GPS priors in the explicitly selected calibration set retained"
     metadata["loss_scale"] = joint_robust_loss_scale
     metadata["reprojection_world_points_file"] = "adjusted_world_points.csv"
     metadata["raw_gps_prior_file"] = "world_points.csv"
@@ -1035,7 +1455,7 @@ def main():
         "gps_correction_median_m": float(np.median(gps_distances)),
         "gps_correction_rms_m": float(np.sqrt(np.mean(gps_distances ** 2))),
         "gps_correction_maximum_m": float(np.max(gps_distances)),
-        "largest_gps_correction_point_ids": (np.argsort(gps_distances)[-10:][::-1] + 1).tolist(),
+        "largest_gps_correction_point_ids": point_ids[np.argsort(gps_distances)[-10:][::-1]].tolist(),
         "metric_accuracy_verified": False,
         "interpretation": "Shared image residuals indicate disagreement between measured antenna-based GPS targets and image-derived target positions. This does not identify whether timing, motion, antenna offset, or GPS error is responsible. A constant 4 cm world offset is absorbed by translation and cannot remove point-dependent errors.",
         "scope": "Assumes fixed intrinsics/extrinsics and the same stationary target position across all three views of each ID. No synchronized exposure timestamps or independent metric checkpoints are available.",
@@ -1094,7 +1514,7 @@ def main():
                              "du_original_gps_px", "dv_original_gps_px", "original_gps_error_px"])
             projected = points[camera] + residuals
             for index in range(len(world_points)):
-                writer.writerow([index + 1, *points[camera][index], *projected[index], *residuals[index],
+                writer.writerow([point_ids[index], *points[camera][index], *projected[index], *residuals[index],
                                  np.linalg.norm(residuals[index]), *gps_pixel_residuals[index],
                                  np.linalg.norm(gps_pixel_residuals[index])])
         print(f"\n{camera}: joint BA RMSE={result['reprojection_rmse_px']:.4f} px; final skew=0 px")
@@ -1109,7 +1529,7 @@ def main():
     (run_dir / "calibration_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
 
     print("\nValidating on held-out positions...", flush=True)
-    validation, validation_residuals, validation_world_errors, fold_ids = validate_camera_array(world_points, observations)
+    validation, validation_residuals, validation_world_errors, fold_ids = validate_camera_array(world_points, observations, point_ids)
     diagnostics["cross_validation"] = validation
     with (run_dir / "held_out_validation.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -1119,13 +1539,13 @@ def main():
             results["cameras"][camera]["held_out_prediction_rmse_px"] = validation["per_camera_rmse_px"][camera_index]
             for point in range(len(world_points)):
                 residual = validation_residuals[camera_index, point]
-                writer.writerow([camera, point + 1, fold_ids[point], *residual, np.linalg.norm(residual),
+                writer.writerow([camera, point_ids[point], fold_ids[point], *residual, np.linalg.norm(residual),
                                  *validation_world_errors[point]])
     diagnostics["all_camera_validation_rmse_below_1px"] = bool(
         validation["all_folds_converged"] and np.all(np.asarray(validation["per_camera_rmse_px"]) < 1.0))
     (run_dir / "calibration_results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     (run_dir / "calibration_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
-    diagnostics["bootstrap"] = bootstrap_camera_array(cameras, adjusted_points, world_points, observations, run_dir)
+    diagnostics["bootstrap"] = bootstrap_camera_array(cameras, adjusted_points, world_points, observations, run_dir, point_ids)
     (run_dir / "calibration_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
     print("\nHeld-out prediction RMSE (px):", validation["per_camera_rmse_px"])
     print(f"GPS correction: median={np.median(gps_distances):.4f} m; maximum={np.max(gps_distances):.4f} m")
